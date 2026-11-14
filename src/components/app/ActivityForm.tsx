@@ -153,7 +153,7 @@ export function ActivityFormDialog({
     };
     setSaving(true);
     try {
-      const id = saveActivity(org.id, draft, record?.id);
+      const id = await saveActivity(org.id, draft, record?.id);
       if (file) await uploadEvidence(org.id, file, { facilityId: p.facilityId, reportingPeriodId: period.id, documentType: p.documentType, attachToActivityId: id });
       toast(record ? 'Record updated' : 'Record added');
       onClose();
@@ -288,7 +288,7 @@ export function ActivityFormDialog({
         </Field>
 
         <div className="grid gap-4 rounded-lg border border-dashed border-line p-3 sm:col-span-2 sm:grid-cols-2">
-          <Field label={record?.evidenceDocumentId ? 'Replace supporting document' : 'Supporting document'} hint="PDF or image, up to 10 MB. Stored privately in this browser.">
+          <Field label={record?.evidenceDocumentId ? 'Replace supporting document' : 'Supporting document'} hint="PDF or image, up to 10 MB. Stored privately in your organisation's secure storage.">
             {(p) => <Input type="file" accept=".pdf,image/*" className="py-1.5" onChange={(ev) => setFile(ev.target.files?.[0] ?? null)} {...p} />}
           </Field>
           <Field label="Document type">

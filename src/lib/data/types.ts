@@ -2,7 +2,9 @@ import type { ActivityCategory, CalculationResult, DataQuality, EmissionFactor }
 import type { RunSummary } from '@/lib/engine/calculate';
 import type { ReductionActionType, ScenarioInputs } from '@/lib/engine/reduction';
 
-// Record shapes mirror the planned Supabase tables (see docs/schema.md).
+// Record shapes used by the app. remote.ts maps them to and from the Supabase tables
+// in supabase/migrations (organisation → companies, reporting period → carbon_assessments,
+// activity record → emission_activities).
 
 export type Role = 'owner' | 'admin' | 'editor' | 'viewer';
 
@@ -10,7 +12,6 @@ export interface User {
   id: string;
   email: string;
   name: string;
-  passwordHash: string;
   createdAt: string;
 }
 
@@ -105,7 +106,7 @@ export interface EvidenceDocument {
   fileName: string;
   mimeType: string;
   sizeBytes: number;
-  /** Key of the blob in browser IndexedDB (demo stand-in for private Supabase Storage). */
+  /** Object path in the private "evidence" storage bucket: <companyId>/<documentId>/<file name>. */
   storagePath: string;
   documentType: string;
   reviewStatus: ReviewStatus;

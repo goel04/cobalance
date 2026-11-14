@@ -7,7 +7,9 @@ import { attempt, toast } from '@/components/ui/toast';
 import { FacilityForm, OrganizationForm } from '@/components/app/forms';
 import { cn } from '@/lib/cn';
 import { monthsBetween, periodPresets } from '@/lib/constants';
-import { createFacility, createOrganization, createPeriod, logOut, saveActivity, setOnboardingStep, type ActivityDraft } from '@/lib/data/actions';
+import { createFacility, createOrganization, createPeriod, importActivities, setOnboardingStep, type ActivityDraft } from '@/lib/data/actions';
+import { LegacyImportCard } from '@/components/app/LegacyImport';
+import { GuestBanner, useLogOut } from '@/components/app/GuestAccount';
 import { useAuth, useOrg } from '@/lib/data/hooks';
 import { createSampleOrganization } from '@/lib/data/seed';
 import { fmtMonth } from '@/lib/format';
@@ -22,8 +24,12 @@ export default function OnboardingPage() {
   const org = ctx.org && !ctx.org.isSample ? ctx.org : null;
   const step = org ? Math.min(org.onboardingStep, 3) : 0;
 
-  const exploreSample = () => {
-    const id = attempt(() => createSampleOrganization());
+  const { requestLogOut, dialogs: logOutDialogs } = useLogOut();
+  const [creatingSample, setCreatingSample] = useState(false);
+  const exploreSample = async () => {
+    setCreatingSample(true);
+    const id = await attempt(() => createSampleOrganization());
+    setCreatingSample(false);
     if (id) {
       toast('Sample organisation created. All of its data is illustrative.');
       navigate('/app/dashboard');
@@ -38,13 +44,15 @@ export default function OnboardingPage() {
             <Logo />
           </Link>
           <div className="flex items-center gap-3 text-sm text-ink-muted">
-            <span className="hidden sm:inline">{user?.email}</span>
-            <Button variant="ghost" size="sm" onClick={() => { logOut(); navigate('/'); }}>
-              Log out
+            <span className="hidden sm:inline">{user?.isAnonymous ? 'Guest' : user?.email}</span>
+            <Button variant="ghost" size="sm" onClick={requestLogOut}>
+              {user?.isAnonymous ? 'Leave' : 'Log out'}
             </Button>
+            {logOutDialogs}
           </div>
         </div>
       </header>
+      <GuestBanner />
       <main className="container-page max-w-3xl py-8 sm:py-12">
         <p className="eyebrow">Set up Cobalance</p>
         <h1 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">Let's set up your organisation</h1>
@@ -69,7 +77,7 @@ export default function OnboardingPage() {
             <>
               <h2 className="text-lg font-semibold">Organisation profile</h2>
               <p className="mb-6 mt-1 text-sm text-ink-muted">Tell us about your business.</p>
-              <OrganizationForm submitLabel="Save and continue" onSubmit={(v) => attempt(() => createOrganization(v), 'Organisation saved')} />
+              <OrganizationForm submitLabel="Save and continue" onSubmit={async (v) => void (await attempt(() => createOrganization(v), 'Organisation saved'))} />
             </>
           )}
           {step === 1 && org && (
@@ -80,11 +88,11 @@ export default function OnboardingPage() {
                 country={org.country}
                 defaultValues={{ state: org.state, city: org.city, industry: org.industry }}
                 submitLabel="Save and continue"
-                onSubmit={(v) =>
-                  attempt(() => {
-                    createFacility(org.id, v);
-                    setOnboardingStep(org.id, 2);
-                  }, 'Facility saved')
+                onSubmit={async (v) =>
+                  void (await attempt(async () => {
+                    await createFacility(org.id, v);
+                    await setOnboardingStep(org.id, 2);
+                  }, 'Facility saved'))
                 }
               />
             </>
@@ -92,6 +100,8 @@ export default function OnboardingPage() {
           {step === 2 && org && <PeriodStep orgId={org.id} />}
           {step === 3 && org && <AssessmentStep onDone={() => navigate('/app/dashboard')} />}
         </Card>
+
+        {step === 0 && <LegacyImportCard className="mt-6" />}
 
         {step === 0 && (
           <Card className="mt-6 flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
@@ -102,7 +112,7 @@ export default function OnboardingPage() {
                 <p className="text-sm text-ink-muted">Open a separate sample organisation with illustrative data. It never mixes with your own records.</p>
               </div>
             </div>
-            <Button variant="outline" onClick={exploreSample}>
+            <Button variant="outline" onClick={exploreSample} loading={creatingSample}>
               Explore sample data
             </Button>
           </Card>
@@ -117,18 +127,22 @@ function PeriodStep({ orgId }: { orgId: string }) {
   const [choice, setChoice] = useState(presets[0].label);
   const [custom, setCustom] = useState({ label: '', startDate: '', endDate: '' });
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const isCustom = choice === 'custom';
   const selected = isCustom ? custom : presets.find((p) => p.label === choice)!;
 
-  const submit = () => {
+  const submit = async () => {
     setError(null);
     if (!selected.label.trim() || !selected.startDate || !selected.endDate) return setError('Enter a name, start date and end date.');
+    setBusy(true);
     try {
-      createPeriod(orgId, selected);
-      setOnboardingStep(orgId, 3);
+      await createPeriod(orgId, selected);
+      await setOnboardingStep(orgId, 3);
       toast('Reporting period saved');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not save.');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -165,7 +179,7 @@ function PeriodStep({ orgId }: { orgId: string }) {
         </div>
       )}
       {error && <Notice tone="error" className="mt-4">{error}</Notice>}
-      <Button className="mt-6" onClick={submit}>
+      <Button className="mt-6" onClick={submit} loading={busy}>
         Save and continue
       </Button>
     </>
@@ -178,12 +192,13 @@ function AssessmentStep({ onDone }: { onDone: () => void }) {
   const [month, setMonth] = useState(months[0] ?? '');
   const [v, setV] = useState({ kwh: '', bill: '', fuel: 'diesel', fuelQty: '', fuelUnit: 'L', vehFuel: 'diesel', vehQty: '', production: '' });
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   if (!org || !period) return null;
   const facility = facilities[0];
 
   const num = (s: string) => (s.trim() === '' ? null : Number(s));
 
-  const save = () => {
+  const save = async () => {
     setError(null);
     const entries = [v.kwh, v.bill, v.fuelQty, v.vehQty, v.production].map(num);
     if (entries.some((x) => x !== null && (!Number.isFinite(x) || x < 0))) return setError('Quantities must be zero or positive numbers.');
@@ -202,25 +217,34 @@ function AssessmentStep({ onDone }: { onDone: () => void }) {
       reviewStatus: 'unreviewed',
       notes: '',
     };
+    const drafts: ActivityDraft[] = [];
+    if (num(v.kwh) !== null) drafts.push({ ...base, category: 'purchased_electricity', subtype: 'grid', quantity: num(v.kwh), unit: 'kWh', costAmount: num(v.bill) });
+    if (num(v.fuelQty) !== null) drafts.push({ ...base, category: 'stationary_combustion', subtype: v.fuel, quantity: num(v.fuelQty), unit: v.fuelUnit });
+    if (num(v.vehQty) !== null) drafts.push({ ...base, category: 'mobile_combustion', subtype: v.vehFuel, quantity: num(v.vehQty), unit: 'L' });
+    if (num(v.production) !== null) drafts.push({ ...base, category: 'production', subtype: 'output', quantity: num(v.production), unit: facility.productionUnit });
+    setBusy(true);
     try {
-      if (num(v.kwh) !== null) saveActivity(org.id, { ...base, category: 'purchased_electricity', subtype: 'grid', quantity: num(v.kwh), unit: 'kWh', costAmount: num(v.bill) });
-      if (num(v.fuelQty) !== null) saveActivity(org.id, { ...base, category: 'stationary_combustion', subtype: v.fuel, quantity: num(v.fuelQty), unit: v.fuelUnit });
-      if (num(v.vehQty) !== null) saveActivity(org.id, { ...base, category: 'mobile_combustion', subtype: v.vehFuel, quantity: num(v.vehQty), unit: 'L' });
-      if (num(v.production) !== null) saveActivity(org.id, { ...base, category: 'production', subtype: 'output', quantity: num(v.production), unit: facility.productionUnit });
-      setOnboardingStep(org.id, 4);
+      // One request for all entries: either every record is saved or none is.
+      if (drafts.length) await importActivities(org.id, drafts.map((d) => ({ ...d })));
+      await setOnboardingStep(org.id, 4);
       toast('Setup complete');
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not save.');
+    } finally {
+      setBusy(false);
     }
   };
 
-  const skip = () => {
+  const skip = async () => {
+    setBusy(true);
     try {
-      setOnboardingStep(org.id, 4);
+      await setOnboardingStep(org.id, 4);
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not save.');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -292,8 +316,10 @@ function AssessmentStep({ onDone }: { onDone: () => void }) {
       </div>
       {error && <Notice tone="error" className="mt-4">{error}</Notice>}
       <div className="mt-6 flex flex-wrap gap-2">
-        <Button onClick={save}>Save and finish</Button>
-        <Button variant="ghost" onClick={skip}>
+        <Button onClick={save} loading={busy}>
+          Save and finish
+        </Button>
+        <Button variant="ghost" onClick={skip} disabled={busy}>
           Skip for now
         </Button>
       </div>

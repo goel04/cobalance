@@ -2,15 +2,12 @@ import { useMemo } from 'react';
 import { useDb } from './store';
 import { canAdmin, canEdit, factorsFor, roleOf } from './actions';
 
-export function useAuth() {
-  const db = useDb();
-  const user = db.users.find((u) => u.id === db.session.userId) ?? null;
-  return { db, user };
-}
+export { useAuth } from '@/lib/auth';
 
 /**
  * Everything the app needs about the active organisation, scoped by membership.
- * Records from organisations the user does not belong to are never returned.
+ * Records from organisations the user does not belong to are never returned
+ * (and Row Level Security never sends them to the browser in the first place).
  */
 export function useOrg() {
   const db = useDb();

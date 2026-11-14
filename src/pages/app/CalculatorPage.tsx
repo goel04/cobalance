@@ -20,12 +20,15 @@ export default function CalculatorPage() {
   const [tab, setTab] = useState<Tab>('summary');
   const [runId, setRunId] = useState<string>('latest');
   const [adding, setAdding] = useState<{ scope: Scope; category?: ActivityCategory } | null>(null);
+  const [calculating, setCalculating] = useState(false);
   const run = runId === 'latest' ? latestRun : periodRuns.find((r) => r.id === runId) ?? latestRun;
 
   if (!org || !period) return null;
 
-  const calculate = () => {
-    const id = attempt(() => createCalculationRun(org.id, period.id), 'Calculation run saved');
+  const calculate = async () => {
+    setCalculating(true);
+    const id = await attempt(() => createCalculationRun(org.id, period.id), 'Calculation run saved');
+    setCalculating(false);
     if (id) setRunId('latest');
   };
 
@@ -36,7 +39,7 @@ export default function CalculatorPage() {
         description="Scope 1, 2 and 3 emissions calculated from your activity records and a documented, versioned emission-factor library."
         actions={
           canEdit && (
-            <Button onClick={calculate} disabled={periodActivities.length === 0}>
+            <Button onClick={calculate} disabled={periodActivities.length === 0} loading={calculating}>
               <Calculator className="h-4 w-4" /> Calculate footprint
             </Button>
           )
@@ -366,9 +369,9 @@ function BoundaryDialog({ open, onClose }: { open: boolean; onClose: () => void 
   const [error, setError] = useState<string | null>(null);
   if (!period) return null;
   const toggle = (c: ActivityCategory, on: boolean) => setDraft((d) => (on ? [...d, { category: c, reason: '' }] : d.filter((x) => x.category !== c)));
-  const save = () => {
+  const save = async () => {
     if (draft.some((x) => !x.reason.trim())) return setError('Give a reason for every excluded category — reports disclose it.');
-    if (attempt(() => (setScope3Exclusions(period.id, draft), true), 'Reporting boundary updated')) onClose();
+    if (await attempt(() => setScope3Exclusions(period.id, draft).then(() => true), 'Reporting boundary updated')) onClose();
   };
   return (
     <Dialog

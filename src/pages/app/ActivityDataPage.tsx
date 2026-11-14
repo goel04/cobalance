@@ -7,8 +7,7 @@ import { CalcStatusBadge, EvidenceBadge, QualityBadge, ScopeBadge, recordCalcSta
 import { CATEGORIES, categoryLabel, subtypeLabel } from '@/lib/engine/catalog';
 import { UNIT_LABELS } from '@/lib/engine/units';
 import { completeness } from '@/lib/data/analytics';
-import { deleteActivity, deleteEvidence, importActivities, setActivityReview, uploadEvidence } from '@/lib/data/actions';
-import { getFile } from '@/lib/data/evidence-files';
+import { deleteActivity, deleteEvidence, downloadEvidence, importActivities, setActivityReview, uploadEvidence } from '@/lib/data/actions';
 import { useOrg } from '@/lib/data/hooks';
 import type { ActivityRecord } from '@/lib/data/types';
 import { CSV_TEMPLATE, downloadText, parseCsv, toCsv, validateRows, type ParsedRow } from '@/lib/csv-import';
@@ -255,7 +254,9 @@ export default function ActivityDataPage() {
             <Button variant="outline" onClick={() => setDeleting(null)}>
               Cancel
             </Button>
-            <Button variant="danger" onClick={() => deleting && attempt(() => (deleteActivity(deleting.id), setDeleting(null)), 'Record deleted')}>
+            <Button variant="danger" onClick={async () => {
+                if (deleting && (await attempt(() => deleteActivity(deleting.id).then(() => true), 'Record deleted'))) setDeleting(null);
+              }}>
               Delete
             </Button>
           </>
@@ -276,8 +277,12 @@ function EvidenceList() {
   const docs = evidence.filter((e) => !period || e.reportingPeriodId === period.id || e.reportingPeriodId === null);
   if (docs.length === 0) return null;
   const open = async (path: string, name: string) => {
-    const blob = await getFile(path).catch(() => undefined);
-    if (!blob) return toast('File not found in this browser.', 'error');
+    let blob: Blob;
+    try {
+      blob = await downloadEvidence(path);
+    } catch (e) {
+      return toast(e instanceof Error ? e.message : 'Could not download the file.', 'error');
+    }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -287,7 +292,7 @@ function EvidenceList() {
   };
   return (
     <Card className="mt-6">
-      <CardHeader title="Supporting documents" description="Stored privately in this browser (IndexedDB). Not uploaded anywhere." />
+      <CardHeader title="Supporting documents" description="Stored privately in your organisation's secure storage. Only its members can open them." />
       <ul className="divide-y divide-line">
         {docs.map((d) => {
           const linked = activities.filter((a) => a.evidenceDocumentId === d.id).length;
@@ -379,6 +384,7 @@ function CsvImportDialog({ open, onClose }: { open: boolean; onClose: () => void
   const [parsed, setParsed] = useState<ParsedRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [skipDupes, setSkipDupes] = useState(true);
+  const [importing, setImporting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   if (!org || !period) return null;
 
@@ -416,9 +422,12 @@ function CsvImportDialog({ open, onClose }: { open: boolean; onClose: () => void
             Cancel
           </Button>
           <Button
-            disabled={!valid.length}
-            onClick={() => {
-              const n = attempt(() => importActivities(org.id, valid.map((v) => v.draft!)));
+            disabled={!valid.length || importing}
+            loading={importing}
+            onClick={async () => {
+              setImporting(true);
+              const n = await attempt(() => importActivities(org.id, valid.map((v) => v.draft!)));
+              setImporting(false);
               if (n !== undefined) {
                 toast(`Imported ${n} records`);
                 close();

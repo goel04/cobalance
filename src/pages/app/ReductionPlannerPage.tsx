@@ -81,7 +81,12 @@ export default function ReductionPlannerPage() {
             <Button variant="outline" onClick={() => setDeleting(null)}>
               Cancel
             </Button>
-            <Button variant="danger" onClick={() => deleting && attempt(() => (deleteReductionAction(deleting.id), setDeleting(null)), 'Scenario deleted')}>
+            <Button
+              variant="danger"
+              onClick={async () => {
+                if (deleting && (await attempt(() => deleteReductionAction(deleting.id).then(() => true), 'Scenario deleted'))) setDeleting(null);
+              }}
+            >
               Delete
             </Button>
           </>
@@ -366,7 +371,7 @@ function ScenarioDialog({ action, onClose }: { action: ReductionAction | null; o
     setF((cur) => ({ ...cur, [k]: value }));
   };
 
-  const save = () => {
+  const save = async () => {
     setError(null);
     if (!f.title.trim()) return setError('Give the scenario a title.');
     if (!inputs) return setError('All scenario inputs must be zero or positive numbers.');
@@ -384,7 +389,7 @@ function ScenarioDialog({ action, onClose }: { action: ReductionAction | null; o
       limitations: f.limitations.trim(),
       status: f.status,
     };
-    if (attempt(() => saveReductionAction(org.id, draft, action?.id), action ? 'Scenario updated' : 'Scenario saved')) onClose();
+    if (await attempt(() => saveReductionAction(org.id, draft, action?.id), action ? 'Scenario updated' : 'Scenario saved')) onClose();
   };
 
   const u = f.baselineUnit;

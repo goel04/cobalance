@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from 'react';
-import type { DB } from './types';
+import type { DB, Session } from './types';
 
-// Demo-mode persistence. The whole dataset lives in this browser's localStorage;
-// nothing is sent to a server. Swap this module for a Supabase-backed repository
-// when the backend is connected — callers only use getDb/update/useDb.
+// In-memory cache of the signed-in user's data, loaded from Supabase (see remote.ts).
+// Company data is never written to localStorage: a reload fetches it again, and
+// logging out clears it. Only the UI selection (organisation / period / facility)
+// is remembered per user, because it is not company data.
 
-const KEY = 'cobalance.demo.v1';
+export const emptySession = (): Session => ({ userId: null, organizationId: null, periodId: null, facilityId: 'all' });
 
 export const emptyDb = (): DB => ({
   version: 1,
@@ -21,52 +22,42 @@ export const emptyDb = (): DB => ({
   reports: [],
   factors: [],
   audit: [],
-  session: { userId: null, organizationId: null, periodId: null, facilityId: 'all' },
+  session: emptySession(),
 });
 
-function load(): DB {
-  try {
-    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(KEY) : null;
-    if (!raw) return emptyDb();
-    const parsed = JSON.parse(raw) as DB;
-    if (parsed.version !== 1) return emptyDb();
-    return { ...emptyDb(), ...parsed };
-  } catch {
-    return emptyDb();
-  }
-}
+export type LoadState = { status: 'idle' | 'loading' | 'ready' } | { status: 'error'; message: string };
 
-let db: DB = load();
+let db: DB = emptyDb();
+let loadState: LoadState = { status: 'idle' };
 const listeners = new Set<() => void>();
-
-export class StorageError extends Error {}
-
-function persist(next: DB) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(next));
-  } catch {
-    throw new StorageError('Could not save: this browser\'s storage is full or unavailable. Your last change was not saved.');
-  }
-}
+const emit = () => listeners.forEach((l) => l());
 
 export function getDb(): DB {
   return db;
 }
 
-/** Apply a mutation to a copy of the database, persist it, then notify subscribers. */
+/** Apply a mutation to a copy of the cache, then notify subscribers. Callers write to Supabase first. */
 export function update<T>(fn: (draft: DB) => T): T {
   const draft = structuredClone(db);
   const out = fn(draft);
-  persist(draft);
   db = draft;
-  listeners.forEach((l) => l());
+  if (draft.session.userId) savePrefs(draft.session);
+  emit();
   return out;
 }
 
 export function replaceDb(next: DB) {
-  persist(next);
   db = next;
-  listeners.forEach((l) => l());
+  emit();
+}
+
+export function getLoadState(): LoadState {
+  return loadState;
+}
+
+export function setLoadState(next: LoadState) {
+  loadState = next;
+  emit();
 }
 
 function subscribe(l: () => void) {
@@ -78,12 +69,29 @@ export function useDb(): DB {
   return useSyncExternalStore(subscribe, getDb, getDb);
 }
 
-if (typeof window !== 'undefined') {
-  // Keep tabs in sync.
-  window.addEventListener('storage', (e) => {
-    if (e.key === KEY) {
-      db = load();
-      listeners.forEach((l) => l());
-    }
-  });
+export function useLoadState(): LoadState {
+  return useSyncExternalStore(subscribe, getLoadState, getLoadState);
+}
+
+// ── Per-user UI selection ───────────────────────────────────────────────────
+
+const prefsKey = (userId: string) => `cobalance.prefs.${userId}`;
+
+export function loadPrefs(userId: string): Omit<Session, 'userId'> | null {
+  try {
+    const raw = localStorage.getItem(prefsKey(userId));
+    if (!raw) return null;
+    const p = JSON.parse(raw) as Partial<Session>;
+    return { organizationId: p.organizationId ?? null, periodId: p.periodId ?? null, facilityId: p.facilityId ?? 'all' };
+  } catch {
+    return null;
+  }
+}
+
+function savePrefs(s: Session) {
+  try {
+    localStorage.setItem(prefsKey(s.userId!), JSON.stringify({ organizationId: s.organizationId, periodId: s.periodId, facilityId: s.facilityId }));
+  } catch {
+    // Preferences are a convenience; ignore storage failures.
+  }
 }

@@ -19,17 +19,19 @@ export function PrivacyPage() {
       <Section>
         <DraftNotice />
         <Prose>
-          <h2>1. Early-access storage</h2>
+          <h2>1. Where your data is stored</h2>
           <p>
-            In the current early-access version, the information you enter into the Cobalance app — your account details, organisation and facility profiles, activity data, calculations, reduction plans and uploaded evidence files — is stored <strong>only in your web browser</strong>, using localStorage and IndexedDB on your device. It is not sent to or stored on Cobalance servers.
+            The information you enter into the Cobalance app — your account details, organisation and facility profiles, activity data, calculations, reduction plans and uploaded
+            evidence files — is stored in Cobalance's hosted database and private file storage, provided by our infrastructure provider Supabase. The website itself is served by
+            Vercel.
           </p>
           <ul>
-            <li>Clearing your browser data, or using a different browser or device, will remove or hide this data.</li>
-            <li>Anyone with access to your browser profile may be able to access it.</li>
-            <li>You can delete all app data at any time from Settings in the app.</li>
+            <li>Your organisation's records and documents can only be read by members of that organisation. Access is enforced by the database on every request.</li>
+            <li>Uploaded documents are kept in private storage and are never publicly accessible.</li>
+            <li>Your browser only remembers your sign-in session and which organisation and period you last viewed.</li>
           </ul>
           <h2>2. Information we collect</h2>
-          <p>When our hosted platform launches, we expect to collect:</p>
+          <p>We collect:</p>
           <ul>
             <li>Account information such as your name and email address.</li>
             <li>Business information you provide, such as organisation, facility and operational data.</li>
@@ -50,7 +52,7 @@ export function PrivacyPage() {
           <h2>5. Your choices</h2>
           <p>You can access, export or delete your data. For questions, contact <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.</p>
           <h2>6. Changes</h2>
-          <p>We will update this policy before the hosted platform launches and will highlight material changes.</p>
+          <p>We will highlight material changes to this policy before they take effect.</p>
         </Prose>
       </Section>
     </>
@@ -66,7 +68,7 @@ export function TermsPage() {
         <Prose>
           <h2>1. Early access</h2>
           <p>
-            Cobalance is provided as an early-access product. Features may change, and data is stored in your browser (see our <Link to="/privacy">Privacy Policy</Link>). You are responsible for keeping your own copies of important data.
+            Cobalance is provided as an early-access product. Features may change. Your data is stored in our hosted platform (see our <Link to="/privacy">Privacy Policy</Link>); we recommend keeping your own copies of important data, which you can export from Settings at any time.
           </p>
           <h2>2. Estimates, not guarantees</h2>
           <ul>
