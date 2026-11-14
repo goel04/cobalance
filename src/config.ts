@@ -1,3 +1,3 @@
-// Public contact details. Replace with the real company inbox before launch.
-export const CONTACT_EMAIL = 'hello@cobalance.example';
-export const DEMO_MODE = true; // No backend is connected in this build.
+// Public contact details, used by the footer, contact, privacy and partnership pages.
+export const CONTACT_EMAIL = 'hello@cobalance.tech';
+// Data is stored in Supabase (see src/lib/supabase.ts and supabase/migrations).

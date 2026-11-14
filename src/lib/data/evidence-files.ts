@@ -1,5 +1,7 @@
-// Evidence files are kept in this browser's IndexedDB (demo stand-in for a
-// private Supabase Storage bucket). They never leave the device.
+// Read-only access to evidence files saved in this browser's IndexedDB by the
+// earlier demo version. New files go to the private Supabase "evidence" bucket
+// (see uploadEvidence in actions.ts); this module only exists so legacy files can
+// be imported (legacy.ts) and, when the user asks, removed.
 
 const DB_NAME = 'cobalance-evidence';
 const STORE = 'files';
@@ -22,7 +24,5 @@ async function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBReq
   });
 }
 
-export const putFile = (key: string, file: Blob) => tx('readwrite', (s) => s.put(file, key));
-export const getFile = (key: string) => tx<Blob | undefined>('readonly', (s) => s.get(key));
-export const deleteFile = (key: string) => tx('readwrite', (s) => s.delete(key));
-export const clearFiles = () => tx('readwrite', (s) => s.clear());
+export const getLegacyFile = (key: string) => tx<Blob | undefined>('readonly', (s) => s.get(key));
+export const clearLegacyFiles = () => tx('readwrite', (s) => s.clear());

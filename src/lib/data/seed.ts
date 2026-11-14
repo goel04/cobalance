@@ -1,8 +1,9 @@
 import { METHODOLOGY_VERSION } from '@/lib/engine/calculate';
 import type { EmissionFactor } from '@/lib/engine/types';
-import { normalize, runInto, uid } from './actions';
-import { update } from './store';
-import type { ActivityRecord, DB } from './types';
+import { createCalculationRun, normalize, reloadAccount, switchOrganization, uid } from './actions';
+import { importBundle, type Bundle } from './bundle';
+import { getDb } from './store';
+import type { ActivityRecord, DB, ReductionAction } from './types';
 
 // Sample organisation for exploring Cobalance. Everything here is illustrative:
 // it lives in a separate organisation flagged isSample, and sample factors are
@@ -36,15 +37,14 @@ function sampleFactor(orgId: string, over: Partial<EmissionFactor> & Pick<Emissi
   };
 }
 
-export function createSampleOrganization(): string {
-  return update((d: DB) => {
-    const userId = d.session.userId;
-    if (!userId) throw new Error('Please log in first.');
+/** Builds the sample organisation in memory (ids are placeholders; importBundle assigns real ones). */
+export function buildSampleBundle(userId: string): Bundle {
     const t = new Date().toISOString();
     const orgId = uid();
     const facilityId = uid();
     const periodId = uid();
-
+    // Scratch copy used only so `normalize` can find the sample factors and country.
+    const d: DB = { ...structuredClone(getDb()), factors: [], organizations: [] };
     d.organizations.push({
       id: orgId,
       name: 'Sample Textiles Co. (illustrative)',
@@ -58,7 +58,9 @@ export function createSampleOrganization(): string {
       onboardingStep: 4,
       createdAt: t,
     });
-    d.memberships.push({ organizationId: orgId, userId, role: 'owner', createdAt: t });
+    const org = d.organizations[0];
+    d.facilities = [];
+    d.periods = [];
     d.facilities.push({
       id: facilityId,
       organizationId: orgId,
@@ -145,11 +147,10 @@ export function createSampleOrganization(): string {
     records.push(rec({ category: 'refrigerants', subtype: 'R-410A', activityDate: '2024-06-01', quantity: 3.5, unit: 'kg', notes: 'Sample: AC top-up from service invoice' }));
     records.push(rec({ category: 'stationary_combustion', subtype: 'coal', activityDate: '2024-04-01', quantity: 12, unit: 't', notes: 'Sample: boiler coal — no default factor (needs supplier GCV)' }));
     records.forEach((r) => Object.assign(r, normalize(d, r)));
-    d.activities.push(...records);
 
     const annualKwh = ELECTRICITY.reduce<number>((s, v) => s + (v ?? 0), 0);
     const ta = new Date().toISOString();
-    d.reductionActions.push(
+    const reductionActions: ReductionAction[] = [
       {
         id: uid(),
         organizationId: orgId,
@@ -184,12 +185,29 @@ export function createSampleOrganization(): string {
         createdAt: ta,
         updatedAt: ta,
       },
-    );
+    ];
 
-    d.session.organizationId = orgId;
-    d.session.periodId = periodId;
-    d.session.facilityId = 'all';
-    runInto(d, orgId, periodId);
-    return orgId;
-  });
+    return {
+      org: { name: org.name, industry: org.industry, companySize: org.companySize, country: org.country, state: org.state, city: org.city, website: org.website, onboardingStep: 4 },
+      facilities: d.facilities,
+      periods: d.periods,
+      factors: d.factors,
+      evidence: [],
+      activities: records,
+      reductionActions,
+      runs: [],
+      reports: [],
+    };
+}
+
+/** Creates the sample organisation in Supabase, switches to it and runs a first calculation. */
+export async function createSampleOrganization(): Promise<string> {
+  const userId = getDb().session.userId;
+  if (!userId) throw new Error('Please log in first.');
+  const { orgId } = await importBundle(buildSampleBundle(userId), { isSample: true });
+  await reloadAccount();
+  switchOrganization(orgId);
+  const periodId = getDb().session.periodId;
+  if (periodId) await createCalculationRun(orgId, periodId);
+  return orgId;
 }

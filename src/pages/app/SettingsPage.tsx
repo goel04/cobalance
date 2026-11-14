@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ExternalLink, Plus } from 'lucide-react';
 import { Badge, Button, Card, CardHeader, Dialog, Field, Input, Notice, PageHeader, Select, Tabs, Textarea, td, th } from '@/components/ui';
 import { attempt, toast } from '@/components/ui/toast';
@@ -9,8 +9,9 @@ import { CATEGORIES, CATEGORY_BY_VALUE, categoryLabel, subtypeLabel } from '@/li
 import { factorKgCo2ePerUnit } from '@/lib/engine/calculate';
 import { GWP_AR5, GWP_REFERENCE } from '@/lib/engine/factors';
 import type { ActivityCategory, EmissionFactor } from '@/lib/engine/types';
-import { addCustomFactor, createPeriod, resetAllDemoData, retireFactor, setFactorStatus, switchOrganization, updateOrganization } from '@/lib/data/actions';
+import { addCustomFactor, createPeriod, deleteOrganization, retireFactor, setFactorStatus, switchOrganization, updateOrganization } from '@/lib/data/actions';
 import { createSampleOrganization } from '@/lib/data/seed';
+import { LegacyImportCard } from '@/components/app/LegacyImport';
 import { useOrg } from '@/lib/data/hooks';
 import { downloadText } from '@/lib/csv-import';
 import { periodPresets } from '@/lib/constants';
@@ -18,8 +19,12 @@ import { fmtDate, fmtDateTime, fmtNumber } from '@/lib/format';
 
 type Tab = 'org' | 'periods' | 'factors' | 'members' | 'audit' | 'data';
 
+const TABS: Tab[] = ['org', 'periods', 'factors', 'members', 'audit', 'data'];
+
 export default function SettingsPage() {
-  const [tab, setTab] = useState<Tab>('org');
+  const [params] = useSearchParams();
+  const initial = params.get('tab') as Tab | null;
+  const [tab, setTab] = useState<Tab>(initial && TABS.includes(initial) ? initial : 'org');
   return (
     <>
       <PageHeader title="Settings" description="Organisation, reporting periods, emission factors, members and data." />
@@ -53,7 +58,7 @@ function OrgTab() {
     <Card>
       <CardHeader title="Organisation profile" description={canAdmin ? undefined : 'Only admins and owners can edit the profile.'} />
       <div className="p-5">
-        <OrganizationForm key={org.id} defaultValues={org} disabled={!canAdmin} submitLabel="Save changes" onSubmit={(v) => attempt(() => updateOrganization(org.id, v), 'Organisation updated')} />
+        <OrganizationForm key={org.id} defaultValues={org} disabled={!canAdmin} submitLabel="Save changes" onSubmit={async (v) => void (await attempt(() => updateOrganization(org.id, v), 'Organisation updated'))} />
       </div>
     </Card>
   );
@@ -111,9 +116,9 @@ function PeriodsTab() {
               Cancel
             </Button>
             <Button
-              onClick={() => {
+              onClick={async () => {
                 if (!v.label.trim() || !v.startDate || !v.endDate) return toast('Enter a name, start date and end date.', 'error');
-                if (attempt(() => createPeriod(org.id, v), 'Reporting period added')) {
+                if (await attempt(() => createPeriod(org.id, v), 'Reporting period added')) {
                   setOpen(false);
                   setV({ label: '', startDate: '', endDate: '' });
                 }
@@ -279,7 +284,7 @@ function AddFactorDialog({ onClose }: { onClose: () => void }) {
   const sub = cat.subtypes.find((s) => s.value === v.subtype) ?? cat.subtypes[0];
   const set = (k: keyof typeof v) => (e: { target: { value: string } }) => setV({ ...v, [k]: e.target.value });
 
-  const save = () => {
+  const save = async () => {
     setError(null);
     const value = Number(v.value);
     if (!v.factorCode.trim()) return setError('Enter a factor code.');
@@ -305,7 +310,7 @@ function AddFactorDialog({ onClose }: { onClose: () => void }) {
       reviewStatus: v.reviewStatus,
       notes: v.notes.trim(),
     };
-    if (attempt(() => addCustomFactor(org.id, f), 'Factor added — recalculate to apply it')) onClose();
+    if (await attempt(() => addCustomFactor(org.id, f), 'Factor added — recalculate to apply it')) onClose();
   };
 
   return (
@@ -429,8 +434,8 @@ function MembersTab() {
           return (
             <li key={m.userId} className="flex items-center justify-between gap-3 px-5 py-3 text-sm">
               <div>
-                <p className="font-medium">{u?.name}</p>
-                <p className="text-xs text-ink-muted">{u?.email}</p>
+                <p className="font-medium">{u?.name || (u?.email ? u.email : 'Guest')}</p>
+                <p className="text-xs text-ink-muted">{u?.email || 'No email yet (guest workspace)'}</p>
               </div>
               <Badge tone="green">{m.role}</Badge>
             </li>
@@ -438,9 +443,9 @@ function MembersTab() {
         })}
       </ul>
       <div className="border-t border-line p-5">
-        <Notice tone="info" title="Inviting teammates needs the hosted backend">
-          Roles are enforced on every change (owner and admin manage settings, factors and reviews; editor adds data; viewer reads only). Email invitations will be available once Cobalance is
-          connected to its server; in demo mode each browser holds its own accounts.
+        <Notice tone="info" title="Inviting teammates is coming soon">
+          Roles are enforced by the database on every change (owner and admin manage settings, factors and reviews; editor adds data; viewer reads only). Email invitations are not
+          available yet.
         </Notice>
       </div>
     </Card>
@@ -471,9 +476,10 @@ function AuditTab() {
 }
 
 function DataTab() {
-  const { org, db, orgId, canAdmin, myOrgs } = useOrg();
+  const { org, db, orgId, role, myOrgs } = useOrg();
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
   if (!org) return null;
   const sample = myOrgs.find((o) => o.isSample);
   const exportJson = () => {
@@ -512,28 +518,35 @@ function DataTab() {
           ) : (
             <Button
               variant="outline"
-              onClick={() => {
-                if (attempt(() => createSampleOrganization(), 'Sample organisation created — all of its data is illustrative')) navigate('/app/dashboard');
+              loading={busy}
+              onClick={async () => {
+                setBusy(true);
+                const id = await attempt(() => createSampleOrganization(), 'Sample organisation created — all of its data is illustrative');
+                setBusy(false);
+                if (id) navigate('/app/dashboard');
               }}
             >
               Open sample organisation
             </Button>
           )}
+          {sample && db.memberships.some((m) => m.organizationId === sample.id && m.userId === db.session.userId && m.role === 'owner') && (
+            <Button variant="ghost" className="ml-2" onClick={() => setConfirm(true)}>
+              Delete sample organisation
+            </Button>
+          )}
         </div>
       </Card>
-      <Card>
-        <CardHeader title="Demo storage" description="All data lives in this browser's localStorage and IndexedDB." />
-        <div className="space-y-3 p-5">
-          <p className="text-sm text-ink-muted">Resetting deletes every account, organisation, record and uploaded document stored by Cobalance in this browser. It cannot be undone.</p>
-          <Button variant="danger" onClick={() => setConfirm(true)} disabled={!canAdmin}>
-            Reset all demo data
-          </Button>
-        </div>
-      </Card>
+      <LegacyImportCard />
+      {role === 'owner' && !org.isSample && (
+        <Notice tone="info" title="Where your data lives">
+          Records are stored in Cobalance's database and documents in private storage. Only members of this organisation can read them; every change is checked against
+          their role and recorded in the audit history.
+        </Notice>
+      )}
       <Dialog
         open={confirm}
         onClose={() => setConfirm(false)}
-        title="Reset all demo data?"
+        title="Delete the sample organisation?"
         footer={
           <>
             <Button variant="outline" onClick={() => setConfirm(false)}>
@@ -541,18 +554,22 @@ function DataTab() {
             </Button>
             <Button
               variant="danger"
+              loading={busy}
               onClick={async () => {
-                await resetAllDemoData();
-                navigate('/');
-                toast('Demo data reset');
+                if (!sample) return;
+                setBusy(true);
+                const ok = await attempt(() => deleteOrganization(sample.id).then(() => true), 'Sample organisation deleted');
+                setBusy(false);
+                setConfirm(false);
+                if (ok && sample.id === orgId) navigate('/app/dashboard');
               }}
             >
-              Reset everything
+              Delete sample
             </Button>
           </>
         }
       >
-        <p className="text-sm">This removes all Cobalance data from this browser, including other accounts.</p>
+        <p className="text-sm">All of its illustrative records, runs and scenarios are removed. Your own organisations are not affected.</p>
       </Dialog>
     </div>
   );

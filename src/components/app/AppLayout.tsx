@@ -14,15 +14,32 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  UserRound,
   Settings,
   TrendingDown,
   X,
 } from 'lucide-react';
 import { Logo, LogoMark } from '@/components/brand/Logo';
 import { cn } from '@/lib/cn';
-import { logOut, setFacilityFilter, setPeriod, switchOrganization } from '@/lib/data/actions';
+import { setFacilityFilter, setPeriod, switchOrganization } from '@/lib/data/actions';
 import { useAuth, useOrg } from '@/lib/data/hooks';
+import { useLegacyOrgs } from '@/lib/data/legacy';
 import { useAlerts } from './alerts';
+import { GuestBanner, SaveAccountDialog, useLogOut } from './GuestAccount';
+
+/** Points users with data from the earlier browser-only version to the import in Settings → Data. */
+function LegacyDataBanner() {
+  const pending = useLegacyOrgs().filter((o) => !o.importedAt);
+  if (!pending.length) return null;
+  return (
+    <div className="border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-center text-xs text-amber-900">
+      {pending.length} organisation{pending.length > 1 ? 's' : ''} from the earlier demo version {pending.length > 1 ? 'are' : 'is'} still saved only in this browser.{' '}
+      <Link to="/app/settings?tab=data" className="font-medium underline">
+        Import into your account
+      </Link>
+    </div>
+  );
+}
 
 const NAV = [
   { to: '/app/dashboard', label: 'Overview', icon: LayoutDashboard },
@@ -101,9 +118,8 @@ export function AppLayout() {
 
       <div className={cn('flex min-h-screen flex-col transition-[padding]', collapsed ? 'lg:pl-16' : 'lg:pl-60')}>
         <TopBar onMenu={() => setMobileOpen(true)} />
-        <div className="border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-center text-xs text-amber-900">
-          Demo mode — data is saved only in this browser and is not synced to a server.
-        </div>
+        <GuestBanner />
+        <LegacyDataBanner />
         {org?.isSample && (
           <div className="flex items-center justify-center gap-2 border-b border-sky-200 bg-sky-50 px-4 py-1.5 text-center text-xs text-sky-900">
             <FlaskConical className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -213,6 +229,8 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
   const { org, myOrgs, periods, period, facilities, facilityId } = useOrg();
   const navigate = useNavigate();
   const alerts = useAlerts();
+  const { requestLogOut, dialogs: logOutDialogs } = useLogOut();
+  const [saving, setSaving] = useState(false);
   const selectCls = 'h-9 min-w-0 rounded-lg border border-line bg-surface px-2 text-sm text-ink focus:border-forest focus:outline-none focus:ring-2 focus:ring-forest/20';
 
   return (
@@ -294,8 +312,8 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
         {(close) => (
           <div>
             <div className="border-b border-line px-2 pb-2">
-              <p className="truncate text-sm font-medium">{user?.name}</p>
-              <p className="truncate text-xs text-ink-muted">{user?.email}</p>
+              <p className="truncate text-sm font-medium">{user?.isAnonymous ? 'Guest' : user?.name}</p>
+              <p className="truncate text-xs text-ink-muted">{user?.isAnonymous ? 'Not saved to an email yet' : user?.email}</p>
             </div>
             <p className="px-2 pb-1 pt-3 text-xs font-semibold uppercase tracking-wide text-ink-muted">Organisations</p>
             <ul>
@@ -326,19 +344,32 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
               <button onClick={() => { close(); navigate('/app/settings'); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-canvas">
                 <Settings className="h-4 w-4 text-ink-muted" /> Settings
               </button>
+              {user?.isAnonymous && (
+                <button
+                  onClick={() => {
+                    close();
+                    setSaving(true);
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm font-medium text-forest hover:bg-canvas"
+                >
+                  <UserRound className="h-4 w-4" /> Save your work
+                </button>
+              )}
               <button
                 onClick={() => {
-                  logOut();
-                  navigate('/');
+                  close();
+                  requestLogOut();
                 }}
                 className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-canvas"
               >
-                <LogOut className="h-4 w-4 text-ink-muted" /> Log out
+                <LogOut className="h-4 w-4 text-ink-muted" /> {user?.isAnonymous ? 'Leave guest workspace' : 'Log out'}
               </button>
             </div>
           </div>
         )}
       </Popover>
+      {logOutDialogs}
+      <SaveAccountDialog open={saving} onClose={() => setSaving(false)} />
     </header>
   );
 }

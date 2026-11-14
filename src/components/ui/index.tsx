@@ -9,7 +9,7 @@ type Variant = 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
 type Size = 'sm' | 'md' | 'lg';
 
 const variants: Record<Variant, string> = {
-  primary: 'bg-forest text-white hover:bg-forest-deep shadow-sm',
+  primary: 'bg-forest text-on-forest hover:bg-forest-deep shadow-sm',
   secondary: 'bg-sage-light text-forest-deep hover:bg-sage/60',
   outline: 'border border-line bg-surface text-ink hover:bg-canvas hover:border-sage',
   ghost: 'text-ink hover:bg-forest-50',
@@ -23,7 +23,8 @@ const sizes: Record<Size, string> = {
 
 export const buttonClass = (variant: Variant = 'primary', size: Size = 'md', className?: string) =>
   cn(
-    'inline-flex items-center justify-center rounded-lg font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 whitespace-nowrap',
+    'ui-btn inline-flex items-center justify-center rounded-lg font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 whitespace-nowrap',
+    `ui-btn-${variant}`,
     variants[variant],
     sizes[size],
     className,
@@ -55,7 +56,7 @@ export function ButtonLink({ variant, size, className, ...rest }: LinkProps & { 
 
 export function Card({ className, children, ...rest }: React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <div className={cn('rounded-xl border border-line bg-surface shadow-card', className)} {...rest}>
+    <div className={cn('ui-card rounded-xl border border-line bg-surface shadow-card', className)} {...rest}>
       {children}
     </div>
   );
@@ -76,7 +77,7 @@ export function CardHeader({ title, description, action, className }: { title: R
 // ── Form controls ────────────────────────────────────────────────────────
 
 const control =
-  'block w-full rounded-lg border border-line bg-surface px-3 text-sm text-ink placeholder:text-ink-muted/70 transition-colors focus:border-forest focus:outline-none focus:ring-2 focus:ring-forest/20 disabled:bg-canvas disabled:text-ink-muted aria-[invalid=true]:border-red-400';
+  'ui-control block w-full rounded-lg border border-line bg-surface px-3 text-sm text-ink placeholder:text-ink-muted/70 transition-colors focus:border-forest focus:outline-none focus:ring-2 focus:ring-forest/20 disabled:bg-canvas disabled:text-ink-muted aria-[invalid=true]:border-red-400';
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...rest }, ref) {
   return <input ref={ref} className={cn(control, 'h-10', className)} {...rest} />;
@@ -160,7 +161,7 @@ const noticeStyles = {
 export function Notice({ tone = 'info', title, children, className }: { tone?: keyof typeof noticeStyles; title?: ReactNode; children?: ReactNode; className?: string }) {
   const { cls, Icon } = noticeStyles[tone];
   return (
-    <div className={cn('flex gap-3 rounded-lg border px-4 py-3 text-sm', cls, className)} role={tone === 'error' ? 'alert' : 'status'}>
+    <div className={cn('flex gap-3 rounded-lg border px-4 py-3 text-sm', `ui-notice-${tone}`, cls, className)} role={tone === 'error' ? 'alert' : 'status'}>
       <Icon className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
       <div className="min-w-0 space-y-1">
         {title && <p className="font-medium">{title}</p>}

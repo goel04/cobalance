@@ -2,14 +2,16 @@
 
 Sustainability intelligence for Indian MSME manufacturers: carbon footprint (Scope 1, 2 and selected Scope 3), dashboards, reduction planning and transparent reports.
 
-> **Frontend-only build, demo mode.** There is no backend yet. Accounts, organisations, records and evidence files are stored in the browser (localStorage + IndexedDB) and every app screen says so. Nothing is sent to a server.
+Backend: **Supabase** (Postgres with Row Level Security, Auth, private Storage). Hosting: **Vercel**. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Run it
 
 ```sh
 npm install
+# .env.local needs VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY (see docs/DEPLOYMENT.md)
 npm run dev        # http://localhost:5173
-npm test           # engine + CSV import unit tests (vitest)
+npm test           # all tests: engine, CSV import, data layer, database (PGlite)
+npm run test:db    # migrations + RLS + app write payloads against an in-process Postgres
 npm run build      # type-check + production build
 ```
 
@@ -25,12 +27,20 @@ src/
     factors.ts         Versioned emission-factor library + AR5 GWPs
     calculate.ts       Factor selection, multi-gas → CO2e, run summaries
     reduction.ts       Savings / payback / reduction scenario maths
-  lib/data/          Demo data layer (mirrors the planned Supabase schema)
-    types.ts           Record shapes (organizations, facilities, activity_records, …)
-    store.ts           localStorage persistence — swap for a Supabase repository later
-    actions.ts         All writes, with role checks (RLS stand-in) and audit events
+  lib/supabase.ts    Browser client (publishable key only)
+  lib/auth.tsx       Session provider: loads the account's data on sign-in, clears it on sign-out
+  lib/data/          Data layer
+    types.ts           Record shapes used by the app
+    remote.ts          Supabase repository: row ↔ record mappers, paged loading, friendly errors
+    store.ts           In-memory cache of the signed-in user's data (never persisted locally)
+    actions.ts         Auth + every write: Supabase first (RLS enforces roles), then the cache
+    bundle.ts          All-or-nothing import of a whole organisation (sample data, legacy import)
+    legacy.ts          Import of data saved in the browser by the earlier demo version
     analytics.ts       Dashboard / completeness / Scope 3 status, from saved runs only
     seed.ts            Sample organisation
+supabase/
+  migrations/        Schema, RLS + storage policies, factor library seed
+  tests/             rls_test.sql (SQL editor) + db.test.ts (PGlite)
   lib/reports/       Report model (build.ts) + PDF renderer (pdf.ts)
   lib/csv-import.ts  CSV parsing and validation (tested)
   components/        ui/ primitives, marketing/ site, app/ shell & shared app parts
@@ -48,6 +58,8 @@ src/
 
 Rules the engine enforces: missing quantities are never treated as zero; an activity without a factor is excluded and flagged, never given an invented value; each result stores a snapshot of the factor it used; factors are retired, never edited in place; totals reconcile to the sum of results.
 
-## Next: backend
+## Security model
 
-The data layer is written so Supabase can replace it: `store.ts`/`actions.ts` become calls to Postgres tables with RLS policies matching the role checks in `actions.ts`, evidence moves from IndexedDB to a private Storage bucket, and `createCalculationRun` moves into an Edge Function that imports `src/lib/engine` unchanged.
+Every table has Row Level Security: users read only companies they belong to and write according to their role (viewer < editor < admin < owner). Calculation runs and results are append-only, audit events are written only by triggers, evidence files sit in a private bucket under `<company id>/…`. The browser holds only the publishable key; the app's own role checks exist for friendlier messages, the database is the enforcement point.
+
+Calculations run in the browser with the tested engine and are saved atomically by the `save_calculation_run` RPC. A possible next step is to move the calculation into an Edge Function that imports `src/lib/engine` unchanged, so clients can't submit their own results.
