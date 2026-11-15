@@ -1,8 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Link, NavLink, useLocation } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { ChevronDown, Menu, X } from 'lucide-react';
-import { Logo } from '@/components/brand/Logo';
-import { ButtonLink } from '@/components/ui';
+import { HeaderBrand } from '@/components/brand/Logo';
 import { cn } from '@/lib/cn';
 import { NAV_GROUPS, type NavGroup } from './nav-data';
 
@@ -21,33 +20,20 @@ function Dropdown({ group, open, onOpen, onClose }: { group: NavGroup; open: boo
 
   return (
     <div className="relative" onMouseEnter={enter} onMouseLeave={leave}>
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-controls={id}
-        onClick={() => (open ? onClose() : onOpen())}
-        className={cn(
-          'inline-flex items-center gap-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-          open ? 'bg-forest-50 text-forest-deep' : 'text-ink hover:bg-forest-50 hover:text-forest-deep',
-        )}
-      >
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => (open ? onClose() : onOpen())} className="sp-nav-link">
         {group.label}
-        <ChevronDown className={cn('h-4 w-4 transition-transform', open && 'rotate-180')} aria-hidden />
+        <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
-      <div
-        id={id}
-        hidden={!open}
-        className={cn('absolute left-1/2 top-full z-50 -translate-x-1/2 pt-2', wide ? 'w-[560px]' : 'w-80')}
-      >
-        <ul className={cn('rounded-xl border border-line bg-surface p-2 shadow-pop', wide && 'grid grid-cols-2 gap-1')}>
+      <div id={id} hidden={!open} className={cn('absolute left-1/2 top-full z-50 -translate-x-1/2 pt-3', wide ? 'w-[580px]' : 'w-80')}>
+        <ul className={cn('sp-menu', wide && 'grid grid-cols-2 gap-1')}>
           {group.items.map((item) => (
             <li key={item.to}>
-              <Link to={item.to} onClick={onClose} className="flex gap-3 rounded-lg p-3 transition-colors hover:bg-canvas focus-visible:bg-canvas">
-                <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-forest-50 text-forest">
+              <Link to={item.to} onClick={onClose}>
+                <span className="sp-menu-icon">
                   <item.icon className="h-4 w-4" aria-hidden />
                 </span>
                 <span className="min-w-0">
-                  <span className="block text-sm font-medium text-ink">{item.label}</span>
+                  <span className="block text-sm font-semibold text-ink">{item.label}</span>
                   <span className="mt-0.5 block text-xs leading-relaxed text-ink-muted">{item.description}</span>
                 </span>
               </Link>
@@ -63,6 +49,7 @@ export function Navbar() {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [mobileGroup, setMobileGroup] = useState<string | null>(null);
+  const [stuck, setStuck] = useState(false);
   const navRef = useRef<HTMLElement>(null);
   const { pathname } = useLocation();
 
@@ -70,6 +57,13 @@ export function Navbar() {
     setOpenMenu(null);
     setMobileOpen(false);
   }, [pathname]);
+
+  useEffect(() => {
+    const onScroll = () => setStuck(window.scrollY > 80);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -90,13 +84,13 @@ export function Navbar() {
   }, []);
 
   return (
-    <header ref={navRef} className="sticky top-0 z-40 border-b border-line bg-surface/85 backdrop-blur supports-[backdrop-filter]:bg-surface/75">
-      <nav className="container-page flex h-16 items-center justify-between gap-4" aria-label="Main">
-        <Link to="/" className="rounded-lg" aria-label="Cobalance home">
-          <Logo />
+    <header ref={navRef} className={cn('sp-header', (stuck || mobileOpen) && 'is-stuck')}>
+      <nav className="sp-nav" aria-label="Main">
+        <Link to="/" aria-label="Cobalance home" className="rounded-lg">
+          <HeaderBrand />
         </Link>
 
-        <div className="hidden flex-1 items-center justify-center gap-1 md:flex">
+        <div className="sp-nav-links">
           {NAV_GROUPS.map((g) => (
             <Dropdown
               key={g.label}
@@ -106,20 +100,23 @@ export function Navbar() {
               onClose={() => setOpenMenu((cur) => (cur === g.label ? null : cur))}
             />
           ))}
+          <Link to="/resources" className="sp-nav-link">
+            Resources
+          </Link>
         </div>
 
         <div className="hidden items-center gap-2 md:flex">
-          <NavLink to="/login" className="rounded-lg px-3 py-2 text-sm font-medium text-ink hover:bg-forest-50 hover:text-forest-deep">
+          <Link to="/login" className="sp-nav-link">
             Log in
-          </NavLink>
-          <ButtonLink to="/signup" size="md">
-            Get started
-          </ButtonLink>
+          </Link>
+          <Link to="/signup" className="btn btn-ghost">
+            Sign up
+          </Link>
         </div>
 
         <button
           type="button"
-          className="rounded-lg p-2 text-ink hover:bg-forest-50 md:hidden"
+          className="rounded-full p-2 text-ink hover:bg-white/10 md:hidden"
           aria-expanded={mobileOpen}
           aria-controls="mobile-menu"
           aria-label={mobileOpen ? 'Close menu' : 'Open menu'}
@@ -129,8 +126,8 @@ export function Navbar() {
         </button>
       </nav>
 
-      <div id="mobile-menu" hidden={!mobileOpen} className="border-t border-line bg-surface md:hidden">
-        <div className="container-page max-h-[calc(100vh-4rem)] overflow-y-auto py-3">
+      <div id="mobile-menu" hidden={!mobileOpen} className="border-t border-line md:hidden" data-lenis-prevent>
+        <div className="max-h-[calc(100vh-4.5rem)] overflow-y-auto px-5 py-3">
           <ul className="space-y-1">
             {NAV_GROUPS.map((g) => {
               const expanded = mobileGroup === g.label;
@@ -141,7 +138,7 @@ export function Navbar() {
                     aria-expanded={expanded}
                     aria-controls={`m-${g.label}`}
                     onClick={() => setMobileGroup(expanded ? null : g.label)}
-                    className="flex w-full items-center justify-between rounded-lg px-3 py-3 text-left text-sm font-medium text-ink hover:bg-canvas"
+                    className="flex w-full items-center justify-between rounded-xl px-3 py-3 text-left text-sm font-medium text-ink hover:bg-white/5"
                   >
                     {g.label}
                     <ChevronDown className={cn('h-4 w-4 transition-transform', expanded && 'rotate-180')} aria-hidden />
@@ -149,7 +146,7 @@ export function Navbar() {
                   <ul id={`m-${g.label}`} hidden={!expanded} className="mb-2 space-y-0.5 pl-2">
                     {g.items.map((item) => (
                       <li key={item.to}>
-                        <Link to={item.to} className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-ink hover:bg-canvas">
+                        <Link to={item.to} className="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-ink-muted hover:bg-white/5 hover:text-ink">
                           <item.icon className="h-4 w-4 text-forest" aria-hidden />
                           {item.label}
                         </Link>
@@ -160,11 +157,13 @@ export function Navbar() {
               );
             })}
           </ul>
-          <div className="mt-3 grid grid-cols-2 gap-2 border-t border-line pt-4">
-            <ButtonLink to="/login" variant="outline">
+          <div className="mt-3 grid grid-cols-2 gap-2 border-t border-line pb-2 pt-4">
+            <Link to="/login" className="btn btn-outline">
               Log in
-            </ButtonLink>
-            <ButtonLink to="/signup">Get started</ButtonLink>
+            </Link>
+            <Link to="/signup" className="btn btn-primary">
+              Get started
+            </Link>
           </div>
         </div>
       </div>

@@ -24,7 +24,7 @@ import { CheckList, CtaBand, FeatureCard, IllustrativeLabel, PageHero, Section, 
 import { cn } from '@/lib/cn';
 
 function EarlyAccessNote() {
-  return <p className="mt-6 text-xs text-ink-muted">Early access: data is stored in your browser while our hosted platform is in development.</p>;
+  return <p className="mt-6 text-xs text-ink-muted">Early access: features may change as we build with our first manufacturers.</p>;
 }
 
 function Cta({ to, children }: { to: string; children: ReactNode }) {

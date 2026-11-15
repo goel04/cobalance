@@ -2,8 +2,33 @@ import { calculateAll, ENGINE_VERSION, METHODOLOGY_VERSION, selectFactor, summar
 import { DEFAULT_FACTORS } from '@/lib/engine/factors';
 import { convert } from '@/lib/engine/units';
 import type { ActivityInput, EmissionFactor } from '@/lib/engine/types';
-import { getDb, update, emptyDb, replaceDb } from './store';
-import { clearFiles, deleteFile, putFile } from './evidence-files';
+import { getSupabase } from '@/lib/supabase';
+import { emptyDb, emptySession, getDb, loadPrefs, replaceDb, setLoadState, update } from './store';
+import {
+  activityRow,
+  check,
+  EVIDENCE_BUCKET,
+  facilityRow,
+  factorRow,
+  fetchAll,
+  fetchAudit,
+  friendly,
+  orgProfileRow,
+  periodRow,
+  reductionRow,
+  runRpcArgs,
+  safeFileName,
+  toActivity,
+  toEvidence,
+  toFacility,
+  toFactor,
+  toMembership,
+  toOrganization,
+  toPeriod,
+  toReduction,
+  toReport,
+  ts,
+} from './remote';
 import type {
   ActivityRecord,
   CalculationRun,
@@ -16,9 +41,10 @@ import type {
   ReportingPeriod,
   Role,
   Scope3Exclusion,
+  Session,
 } from './types';
 
-export const uid = () => crypto.randomUUID();
+export const uid = (): string => crypto.randomUUID();
 const now = () => new Date().toISOString();
 
 export class PermissionError extends Error {}
@@ -33,18 +59,16 @@ export function roleOf(d: DB, orgId: string | null, userId: string | null): Role
 export const canEdit = (role: Role | null) => role !== null && ROLE_RANK[role] >= ROLE_RANK.editor;
 export const canAdmin = (role: Role | null) => role !== null && ROLE_RANK[role] >= ROLE_RANK.admin;
 
-/** Organisation-level authorisation: the demo equivalent of the planned RLS policies. */
+/**
+ * Friendly, early role check. The database's Row Level Security policies are the
+ * real enforcement point: a request that slips past this check is still refused.
+ */
 function requireRole(d: DB, orgId: string, min: Role): string {
   const userId = d.session.userId;
   const role = roleOf(d, orgId, userId);
   if (!userId || !role) throw new PermissionError('You are not a member of this organisation.');
   if (ROLE_RANK[role] < ROLE_RANK[min]) throw new PermissionError(`This action needs the ${min} role or higher.`);
   return userId;
-}
-
-function audit(d: DB, organizationId: string | null, action: string, entityType: string, entityId: string | null, summary: string) {
-  d.audit.unshift({ id: uid(), organizationId, userId: d.session.userId, action, entityType, entityId, summary, createdAt: now() });
-  if (d.audit.length > 2000) d.audit.length = 2000;
 }
 
 export function geographyOf(org: Pick<Organization, 'country'> | undefined): string {
@@ -81,51 +105,172 @@ export function normalize(d: DB, r: ActivityRecord): Pick<ActivityRecord, 'norma
   return c.ok ? { normalizedQuantity: c.value, normalizedUnit: f.activityUnit } : { normalizedQuantity: null, normalizedUnit: null };
 }
 
-// ── Auth (demo) ────────────────────────────────────────────────────────────
-
-async function hashPassword(email: string, password: string): Promise<string> {
-  const data = new TextEncoder().encode(`cobalance-demo:${email.toLowerCase()}:${password}`);
-  const buf = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-export async function signUp(name: string, email: string, password: string) {
-  const e = email.trim().toLowerCase();
-  if (getDb().users.some((u) => u.email === e)) throw new Error('An account with this email already exists in this browser. Log in instead.');
-  const passwordHash = await hashPassword(e, password);
-  update((d) => {
-    const id = uid();
-    d.users.push({ id, email: e, name: name.trim(), passwordHash, createdAt: now() });
-    d.session = { userId: id, organizationId: null, periodId: null, facilityId: 'all' };
-    audit(d, null, 'user.signup', 'user', id, `Account created for ${e}`);
-  });
-}
-
-export async function logIn(email: string, password: string) {
-  const e = email.trim().toLowerCase();
-  const user = getDb().users.find((u) => u.email === e);
-  if (!user || user.passwordHash !== (await hashPassword(e, password))) throw new Error('Incorrect email or password.');
-  update((d) => {
-    const m = d.memberships.find((x) => x.userId === user.id && !d.organizations.find((o) => o.id === x.organizationId)?.isSample)
-      ?? d.memberships.find((x) => x.userId === user.id);
-    const periodId = m ? latestPeriodId(d, m.organizationId) : null;
-    d.session = { userId: user.id, organizationId: m?.organizationId ?? null, periodId, facilityId: 'all' };
-    audit(d, null, 'user.login', 'user', user.id, `Logged in`);
-  });
-}
-
-export function logOut() {
-  update((d) => {
-    d.session = { userId: null, organizationId: null, periodId: null, facilityId: 'all' };
-  });
-}
-
-function latestPeriodId(d: DB, orgId: string): string | null {
+function latestPeriodId(d: Pick<DB, 'periods'>, orgId: string): string | null {
   const ps = d.periods.filter((p) => p.organizationId === orgId).sort((a, b) => b.startDate.localeCompare(a.startDate));
   return ps[0]?.id ?? null;
 }
 
-// ── Session context ────────────────────────────────────────────────────────
+// Audit rows are written by database triggers. Refresh the visible history shortly
+// after a burst of changes instead of after every single write.
+const auditTimers = new Map<string, number>();
+function refreshAuditSoon(orgId: string) {
+  window.clearTimeout(auditTimers.get(orgId));
+  auditTimers.set(
+    orgId,
+    window.setTimeout(() => {
+      fetchAudit(getSupabase(), orgId)
+        .then((events) => update((d) => void (d.audit = [...events, ...d.audit.filter((e) => e.organizationId !== orgId)])))
+        .catch(() => undefined);
+    }, 800),
+  );
+}
+
+// ── Auth (Supabase) ────────────────────────────────────────────────────────
+
+const authRedirect = (path: string) => `${window.location.origin}${path}`;
+
+function authMessage(e: { message: string; code?: string }): string {
+  if (e.code === 'invalid_credentials') return 'Incorrect email or password.';
+  if (e.code === 'email_not_confirmed') return 'Confirm your email first: open the link we sent you, then log in.';
+  if (e.code === 'over_email_send_rate_limit' || e.code === 'over_request_rate_limit') return 'Too many attempts. Wait a minute and try again.';
+  if (e.code === 'weak_password') return 'Choose a stronger password.';
+  if (e.code === 'user_already_exists' || e.code === 'email_exists') return 'An account with this email already exists. Log in or reset your password.';
+  if (e.code === 'anonymous_provider_disabled') return 'Guest access is turned off. Create a free account or log in to continue.';
+  return e.message;
+}
+
+// ── Guest (anonymous) accounts ─────────────────────────────────────────────
+// A guest gets a real but anonymous Supabase user, so Row Level Security and
+// every feature work unchanged. Adding an email later converts the same user
+// into a permanent account, keeping all of its data.
+
+/** Sign in as a guest. Requires "Anonymous sign-ins" to be enabled in Supabase Auth. */
+export async function startGuestSession() {
+  const { error } = await getSupabase().auth.signInAnonymously();
+  if (error) throw new Error(authMessage(error));
+}
+
+/**
+ * Step 1 of turning a guest into a permanent account: attach the email.
+ * Supabase emails a confirmation link; it returns to /reset-password?welcome=1,
+ * where the user chooses a password (step 2). Nothing is lost in between.
+ */
+export async function saveGuestAccount(name: string, email: string) {
+  const { error } = await getSupabase().auth.updateUser(
+    { email: email.trim().toLowerCase(), data: { full_name: name.trim() } },
+    { emailRedirectTo: authRedirect('/reset-password?welcome=1') },
+  );
+  if (error) throw new Error(authMessage(error));
+}
+
+/** Copy the account's confirmed name and email into its profile (shown to co-members and in the audit log). */
+export async function syncProfile(user: { id: string; email: string; name: string; isAnonymous?: boolean }) {
+  if (user.isAnonymous || !user.email) return;
+  const known = getDb().users.find((u) => u.id === user.id);
+  if (known && known.email === user.email && (known.name === user.name || !user.name)) return;
+  const patch = { email: user.email, ...(user.name ? { full_name: user.name } : {}) };
+  const res = await getSupabase().from('profiles').update(patch).eq('id', user.id);
+  if (res.error) return; // Cosmetic only; never block the app on it.
+  update((d) => {
+    const u = d.users.find((x) => x.id === user.id);
+    if (u) Object.assign(u, { email: user.email, ...(user.name ? { name: user.name } : {}) });
+  });
+}
+
+/** needsConfirmation is true when the user must open the emailed link before logging in. */
+export async function signUp(name: string, email: string, password: string): Promise<{ needsConfirmation: boolean }> {
+  const { data, error } = await getSupabase().auth.signUp({
+    email: email.trim().toLowerCase(),
+    password,
+    options: { data: { full_name: name.trim() }, emailRedirectTo: authRedirect('/onboarding') },
+  });
+  if (error) throw new Error(authMessage(error));
+  return { needsConfirmation: !data.session };
+}
+
+export class EmailNotConfirmedError extends Error {}
+
+export async function logIn(email: string, password: string) {
+  const { error } = await getSupabase().auth.signInWithPassword({ email: email.trim().toLowerCase(), password });
+  if (error?.code === 'email_not_confirmed') throw new EmailNotConfirmedError(authMessage(error));
+  if (error) throw new Error(authMessage(error));
+}
+
+export async function resendConfirmation(email: string) {
+  const { error } = await getSupabase().auth.resend({ type: 'signup', email: email.trim().toLowerCase(), options: { emailRedirectTo: authRedirect('/onboarding') } });
+  if (error) throw new Error(authMessage(error));
+}
+
+export async function logOut() {
+  // Supabase clears the local session even if the server can't be reached.
+  await getSupabase().auth.signOut().catch(() => undefined);
+  clearAccount();
+}
+
+export async function requestPasswordReset(email: string) {
+  const { error } = await getSupabase().auth.resetPasswordForEmail(email.trim().toLowerCase(), { redirectTo: authRedirect('/reset-password') });
+  if (error) throw new Error(authMessage(error));
+}
+
+export async function updatePassword(password: string) {
+  const { error } = await getSupabase().auth.updateUser({ password });
+  if (error) throw new Error(authMessage(error));
+}
+
+// ── Loading the signed-in account ──────────────────────────────────────────
+
+let loadSeq = 0;
+type AccountUser = { id: string; email: string; name: string; isAnonymous?: boolean };
+let currentUser: AccountUser | null = null;
+
+/** Choose the organisation / period to show: last selection if still valid, else a sensible default. */
+export function pickSession(d: Omit<DB, 'session' | 'version'>, userId: string, prefs: Omit<Session, 'userId'> | null): Session {
+  const mine = d.memberships.filter((m) => m.userId === userId).map((m) => m.organizationId);
+  const isSample = (id: string) => d.organizations.find((o) => o.id === id)?.isSample;
+  const orgId =
+    (prefs?.organizationId && mine.includes(prefs.organizationId) ? prefs.organizationId : null) ?? mine.find((id) => !isSample(id)) ?? mine[0] ?? null;
+  const periodOk = prefs?.periodId && d.periods.some((p) => p.id === prefs.periodId && p.organizationId === orgId);
+  const facilityOk = prefs?.facilityId && d.facilities.some((f) => f.id === prefs.facilityId && f.organizationId === orgId);
+  return {
+    userId,
+    organizationId: orgId,
+    periodId: periodOk ? prefs!.periodId : orgId ? latestPeriodId(d, orgId) : null,
+    facilityId: facilityOk ? prefs!.facilityId : 'all',
+  };
+}
+
+/** Load everything the user can see from Supabase into the in-memory cache. */
+export async function loadAccount(user: AccountUser, opts: { silent?: boolean } = {}) {
+  const seq = ++loadSeq;
+  currentUser = user;
+  // A silent refresh keeps the current screen mounted while new data arrives.
+  if (!opts.silent) setLoadState({ status: 'loading' });
+  try {
+    const data = await fetchAll(getSupabase());
+    if (seq !== loadSeq) return; // A newer load (or a logout) superseded this one.
+    if (!data.users.some((u) => u.id === user.id)) data.users.push({ id: user.id, email: user.email, name: user.name, createdAt: now() });
+    replaceDb({ ...emptyDb(), ...data, session: pickSession(data, user.id, loadPrefs(user.id)) });
+    setLoadState({ status: 'ready' });
+    void syncProfile(user);
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    if (opts.silent) throw e;
+    replaceDb({ ...emptyDb(), session: { ...emptySession(), userId: user.id } });
+    setLoadState({ status: 'error', message: e instanceof Error ? e.message : 'Could not load your data.' });
+  }
+}
+
+/** Re-fetch everything in the background (e.g. after an import). Throws if it fails. */
+export const reloadAccount = () => (currentUser ? loadAccount(currentUser, { silent: true }) : Promise.resolve());
+
+export function clearAccount() {
+  loadSeq++;
+  currentUser = null;
+  replaceDb(emptyDb());
+  setLoadState({ status: 'idle' });
+}
+
+// ── Session context (local UI selection only) ──────────────────────────────
 
 export function switchOrganization(orgId: string) {
   update((d) => {
@@ -152,34 +297,96 @@ export function setFacilityFilter(facilityId: string) {
 
 export type OrgInput = Pick<Organization, 'name' | 'industry' | 'companySize' | 'country' | 'state' | 'city' | 'website'>;
 
-export function createOrganization(input: OrgInput): string {
-  return update((d) => {
-    const userId = d.session.userId;
-    if (!userId) throw new PermissionError('Please log in first.');
-    const id = uid();
-    d.organizations.push({ id, ...input, isSample: false, onboardingStep: 1, createdAt: now() });
-    d.memberships.push({ organizationId: id, userId, role: 'owner', createdAt: now() });
+/** Creates the company and makes the caller its owner, atomically (create_company RPC). */
+export async function createCompanyRemote(input: OrgInput, isSample = false): Promise<string> {
+  const sb = getSupabase();
+  const id = check(
+    await sb.rpc('create_company', {
+      p_name: input.name,
+      p_industry: input.industry,
+      p_company_size: input.companySize,
+      p_country: input.country,
+      p_state: input.state,
+      p_city: input.city,
+      p_website: input.website,
+      p_is_sample: isSample,
+    }),
+    'Could not create the organisation.',
+  ) as string;
+  return id;
+}
+
+/** Pull one company (and its membership rows) into the cache. */
+async function cacheCompany(orgId: string) {
+  const sb = getSupabase();
+  const [company, members] = await Promise.all([
+    sb.from('companies').select('*').eq('id', orgId).single().then((r) => check(r)),
+    sb.from('company_members').select('*').eq('company_id', orgId).then((r) => check(r) ?? []),
+  ]);
+  update((d) => {
+    d.organizations = [...d.organizations.filter((o) => o.id !== orgId), toOrganization(company)];
+    d.memberships = [...d.memberships.filter((m) => m.organizationId !== orgId), ...members.map(toMembership)];
+  });
+}
+
+export async function createOrganization(input: OrgInput): Promise<string> {
+  if (!getDb().session.userId) throw new PermissionError('Please log in first.');
+  const id = await createCompanyRemote(input);
+  await cacheCompany(id);
+  update((d) => {
     d.session.organizationId = id;
     d.session.periodId = null;
-    audit(d, id, 'organization.create', 'organization', id, `Organisation "${input.name}" created`);
-    return id;
+    d.session.facilityId = 'all';
+  });
+  refreshAuditSoon(id);
+  return id;
+}
+
+export async function updateOrganization(orgId: string, input: OrgInput) {
+  requireRole(getDb(), orgId, 'admin');
+  const row = check(await getSupabase().from('companies').update(orgProfileRow(input)).eq('id', orgId).select().single(), 'Could not update the organisation.');
+  update((d) => void (d.organizations = d.organizations.map((o) => (o.id === orgId ? toOrganization(row) : o))));
+  refreshAuditSoon(orgId);
+}
+
+export async function setOnboardingStep(orgId: string, step: number) {
+  const d0 = getDb();
+  requireRole(d0, orgId, 'editor');
+  const current = d0.organizations.find((o) => o.id === orgId)?.onboardingStep ?? 0;
+  if (step <= current) return;
+  check(await getSupabase().from('companies').update({ onboarding_step: step }).eq('id', orgId), 'Could not save your progress.');
+  update((d) => {
+    const o = d.organizations.find((x) => x.id === orgId);
+    if (o) o.onboardingStep = step;
   });
 }
 
-export function updateOrganization(orgId: string, input: OrgInput) {
+/** Owners only. Deletes the company and everything in it (used for sample organisations). */
+export async function deleteOrganization(orgId: string) {
+  requireRole(getDb(), orgId, 'owner');
+  const sb = getSupabase();
+  const paths = getDb().evidence.filter((e) => e.organizationId === orgId).map((e) => e.storagePath);
+  check(await sb.from('companies').delete().eq('id', orgId), 'Could not delete the organisation.');
+  if (paths.length) await sb.storage.from(EVIDENCE_BUCKET).remove(paths).catch(() => undefined);
   update((d) => {
-    requireRole(d, orgId, 'admin');
-    const o = d.organizations.find((x) => x.id === orgId)!;
-    Object.assign(o, input);
-    audit(d, orgId, 'organization.update', 'organization', orgId, 'Organisation profile updated');
-  });
-}
-
-export function setOnboardingStep(orgId: string, step: number) {
-  update((d) => {
-    requireRole(d, orgId, 'editor');
-    const o = d.organizations.find((x) => x.id === orgId)!;
-    o.onboardingStep = Math.max(o.onboardingStep, step);
+    const keep = <T extends { organizationId?: string | null }>(xs: T[]) => xs.filter((x) => x.organizationId !== orgId);
+    d.organizations = d.organizations.filter((o) => o.id !== orgId);
+    d.memberships = keep(d.memberships);
+    d.facilities = keep(d.facilities);
+    d.periods = keep(d.periods);
+    d.activities = keep(d.activities);
+    d.evidence = keep(d.evidence);
+    d.runs = keep(d.runs);
+    d.reductionActions = keep(d.reductionActions);
+    d.reports = keep(d.reports);
+    d.factors = keep(d.factors);
+    d.audit = keep(d.audit);
+    if (d.session.organizationId === orgId) {
+      const next = d.memberships.find((m) => m.userId === d.session.userId);
+      d.session.organizationId = next?.organizationId ?? null;
+      d.session.periodId = next ? latestPeriodId(d, next.organizationId) : null;
+      d.session.facilityId = 'all';
+    }
   });
 }
 
@@ -187,57 +394,70 @@ export function setOnboardingStep(orgId: string, step: number) {
 
 export type FacilityInput = Omit<Facility, 'id' | 'organizationId' | 'createdAt'>;
 
-export function createFacility(orgId: string, input: FacilityInput): string {
-  return update((d) => {
-    requireRole(d, orgId, 'editor');
-    const id = uid();
-    d.facilities.push({ id, organizationId: orgId, ...input, createdAt: now() });
-    audit(d, orgId, 'facility.create', 'facility', id, `Facility "${input.name}" created`);
-    return id;
-  });
+export async function createFacility(orgId: string, input: FacilityInput): Promise<string> {
+  requireRole(getDb(), orgId, 'editor');
+  const row = check(await getSupabase().from('facilities').insert({ company_id: orgId, ...facilityRow(input) }).select().single(), 'Could not add the facility.');
+  const f = toFacility(row);
+  update((d) => void d.facilities.push(f));
+  refreshAuditSoon(orgId);
+  return f.id;
 }
 
-export function updateFacility(id: string, input: FacilityInput) {
-  update((d) => {
-    const f = d.facilities.find((x) => x.id === id)!;
-    requireRole(d, f.organizationId, 'editor');
-    Object.assign(f, input);
-    audit(d, f.organizationId, 'facility.update', 'facility', id, `Facility "${input.name}" updated`);
-  });
+export async function updateFacility(id: string, input: FacilityInput) {
+  const f0 = getDb().facilities.find((x) => x.id === id);
+  if (!f0) throw new Error('Facility not found.');
+  requireRole(getDb(), f0.organizationId, 'editor');
+  const row = check(await getSupabase().from('facilities').update(facilityRow(input)).eq('id', id).select().single(), 'Could not update the facility.');
+  update((d) => void (d.facilities = d.facilities.map((x) => (x.id === id ? toFacility(row) : x))));
+  refreshAuditSoon(f0.organizationId);
 }
 
-export function deleteFacility(id: string) {
+export async function deleteFacility(id: string) {
+  const d0 = getDb();
+  const f = d0.facilities.find((x) => x.id === id);
+  if (!f) return;
+  requireRole(d0, f.organizationId, 'admin');
+  if (d0.activities.some((a) => a.facilityId === id)) throw new Error('This facility has activity records. Delete or move them first.');
+  check(await getSupabase().from('facilities').delete().eq('id', id), 'Could not delete the facility.');
   update((d) => {
-    const f = d.facilities.find((x) => x.id === id)!;
-    requireRole(d, f.organizationId, 'admin');
-    if (d.activities.some((a) => a.facilityId === id)) throw new Error('This facility has activity records. Delete or move them first.');
     d.facilities = d.facilities.filter((x) => x.id !== id);
+    // The database sets these references to null (on delete set null).
+    d.evidence.forEach((e) => e.facilityId === id && (e.facilityId = null));
+    d.reductionActions.forEach((a) => a.facilityId === id && (a.facilityId = null));
     if (d.session.facilityId === id) d.session.facilityId = 'all';
-    audit(d, f.organizationId, 'facility.delete', 'facility', id, `Facility "${f.name}" deleted`);
   });
+  refreshAuditSoon(f.organizationId);
 }
 
 // ── Reporting periods ──────────────────────────────────────────────────────
 
-export function createPeriod(orgId: string, input: Pick<ReportingPeriod, 'label' | 'startDate' | 'endDate'>): string {
+export async function createPeriod(orgId: string, input: Pick<ReportingPeriod, 'label' | 'startDate' | 'endDate'>): Promise<string> {
   if (input.endDate <= input.startDate) throw new Error('End date must be after start date.');
-  return update((d) => {
-    requireRole(d, orgId, 'admin');
-    const id = uid();
-    d.periods.push({ id, organizationId: orgId, ...input, status: 'open', methodologyVersion: METHODOLOGY_VERSION, scope3Exclusions: [], createdAt: now() });
-    d.session.periodId = id;
-    audit(d, orgId, 'period.create', 'reporting_period', id, `Reporting period ${input.label} created`);
-    return id;
+  requireRole(getDb(), orgId, 'admin');
+  const row = check(
+    await getSupabase()
+      .from('carbon_assessments')
+      .insert({ company_id: orgId, ...periodRow({ ...input, status: 'open', methodologyVersion: METHODOLOGY_VERSION, scope3Exclusions: [] }) })
+      .select()
+      .single(),
+    'Could not add the reporting period.',
+  );
+  const p = toPeriod(row);
+  update((d) => {
+    d.periods.push(p);
+    d.session.periodId = p.id;
   });
+  refreshAuditSoon(orgId);
+  return p.id;
 }
 
-export function setScope3Exclusions(periodId: string, exclusions: Scope3Exclusion[]) {
-  update((d) => {
-    const p = d.periods.find((x) => x.id === periodId)!;
-    requireRole(d, p.organizationId, 'admin');
-    p.scope3Exclusions = exclusions;
-    audit(d, p.organizationId, 'period.boundary', 'reporting_period', periodId, `Scope 3 boundary updated (${exclusions.length} excluded)`);
-  });
+export async function setScope3Exclusions(periodId: string, exclusions: Scope3Exclusion[]) {
+  const p0 = getDb().periods.find((x) => x.id === periodId);
+  if (!p0) throw new Error('Reporting period not found.');
+  requireRole(getDb(), p0.organizationId, 'admin');
+  const row = check(await getSupabase().from('carbon_assessments').update({ scope3_exclusions: exclusions }).eq('id', periodId).select().single(), 'Could not update the boundary.');
+  update((d) => void (d.periods = d.periods.map((x) => (x.id === periodId ? toPeriod(row) : x))));
+  refreshAuditSoon(p0.organizationId);
 }
 
 // ── Activity records ───────────────────────────────────────────────────────
@@ -247,64 +467,74 @@ export type ActivityDraft = Omit<
   'id' | 'organizationId' | 'normalizedQuantity' | 'normalizedUnit' | 'createdBy' | 'createdAt' | 'updatedAt'
 >;
 
-export function saveActivity(orgId: string, draft: ActivityDraft, id?: string): string {
-  return update((d) => {
-    const userId = requireRole(d, orgId, 'editor');
-    if (id) {
-      const r = d.activities.find((x) => x.id === id && x.organizationId === orgId);
-      if (!r) throw new Error('Record not found.');
-      Object.assign(r, draft, { updatedAt: now() });
-      Object.assign(r, normalize(d, r));
-      audit(d, orgId, 'activity.update', 'activity_record', id, `Updated ${draft.category}/${draft.subtype} for ${draft.activityDate}`);
-      return id;
+function draftToRecord(d: DB, orgId: string, draft: ActivityDraft, userId: string, id = uid()): ActivityRecord {
+  const rec: ActivityRecord = { ...draft, id, organizationId: orgId, normalizedQuantity: null, normalizedUnit: null, createdBy: userId, createdAt: now(), updatedAt: now() };
+  return Object.assign(rec, normalize(d, rec));
+}
+
+export async function saveActivity(orgId: string, draft: ActivityDraft, id?: string): Promise<string> {
+  const d0 = getDb();
+  const userId = requireRole(d0, orgId, 'editor');
+  const sb = getSupabase();
+  if (id) {
+    const existing = d0.activities.find((x) => x.id === id && x.organizationId === orgId);
+    if (!existing) throw new Error('Record not found.');
+    const rec = draftToRecord(d0, orgId, draft, existing.createdBy, id);
+    const row = check(await sb.from('emission_activities').update(activityRow(rec)).eq('id', id).select().single(), 'Could not save the record.');
+    update((d) => void (d.activities = d.activities.map((x) => (x.id === id ? toActivity(row) : x))));
+    refreshAuditSoon(orgId);
+    return id;
+  }
+  const rec = draftToRecord(d0, orgId, draft, userId);
+  const row = check(
+    await sb.from('emission_activities').insert({ id: rec.id, company_id: orgId, created_by: userId, ...activityRow(rec) }).select().single(),
+    'Could not save the record.',
+  );
+  update((d) => void d.activities.push(toActivity(row)));
+  refreshAuditSoon(orgId);
+  return rec.id;
+}
+
+export async function importActivities(orgId: string, drafts: ActivityDraft[]): Promise<number> {
+  const d0 = getDb();
+  const userId = requireRole(d0, orgId, 'editor');
+  const sb = getSupabase();
+  const rows = drafts.map((draft) => {
+    const rec = draftToRecord(d0, orgId, draft, userId);
+    return { id: rec.id, company_id: orgId, created_by: userId, ...activityRow(rec) };
+  });
+  const saved: ActivityRecord[] = [];
+  try {
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = check(await sb.from('emission_activities').insert(rows.slice(i, i + 500)).select(), 'Could not import the records.');
+      saved.push(...(chunk ?? []).map(toActivity));
     }
-    const rec: ActivityRecord = {
-      ...draft,
-      id: uid(),
-      organizationId: orgId,
-      normalizedQuantity: null,
-      normalizedUnit: null,
-      createdBy: userId,
-      createdAt: now(),
-      updatedAt: now(),
-    };
-    Object.assign(rec, normalize(d, rec));
-    d.activities.push(rec);
-    audit(d, orgId, 'activity.create', 'activity_record', rec.id, `Added ${draft.category}/${draft.subtype} for ${draft.activityDate}`);
-    return rec.id;
-  });
+  } catch (e) {
+    // Don't leave a half-finished import behind: remove whatever was saved.
+    if (saved.length) await sb.from('emission_activities').delete().in('id', saved.map((s) => s.id));
+    throw e;
+  }
+  update((d) => void d.activities.push(...saved));
+  refreshAuditSoon(orgId);
+  return saved.length;
 }
 
-export function importActivities(orgId: string, drafts: ActivityDraft[]): number {
-  return update((d) => {
-    const userId = requireRole(d, orgId, 'editor');
-    for (const draft of drafts) {
-      const rec: ActivityRecord = { ...draft, id: uid(), organizationId: orgId, normalizedQuantity: null, normalizedUnit: null, createdBy: userId, createdAt: now(), updatedAt: now() };
-      Object.assign(rec, normalize(d, rec));
-      d.activities.push(rec);
-    }
-    audit(d, orgId, 'activity.import', 'activity_record', null, `Imported ${drafts.length} records from CSV`);
-    return drafts.length;
-  });
+export async function deleteActivity(id: string) {
+  const r = getDb().activities.find((x) => x.id === id);
+  if (!r) return;
+  requireRole(getDb(), r.organizationId, 'editor');
+  check(await getSupabase().from('emission_activities').delete().eq('id', id), 'Could not delete the record.');
+  update((d) => void (d.activities = d.activities.filter((x) => x.id !== id)));
+  refreshAuditSoon(r.organizationId);
 }
 
-export function deleteActivity(id: string) {
-  update((d) => {
-    const r = d.activities.find((x) => x.id === id)!;
-    requireRole(d, r.organizationId, 'editor');
-    d.activities = d.activities.filter((x) => x.id !== id);
-    audit(d, r.organizationId, 'activity.delete', 'activity_record', id, `Deleted ${r.category}/${r.subtype} for ${r.activityDate}`);
-  });
-}
-
-export function setActivityReview(id: string, status: ActivityRecord['reviewStatus']) {
-  update((d) => {
-    const r = d.activities.find((x) => x.id === id)!;
-    requireRole(d, r.organizationId, 'admin');
-    r.reviewStatus = status;
-    r.updatedAt = now();
-    audit(d, r.organizationId, 'activity.review', 'activity_record', id, `Marked ${status}`);
-  });
+export async function setActivityReview(id: string, status: ActivityRecord['reviewStatus']) {
+  const r = getDb().activities.find((x) => x.id === id);
+  if (!r) return;
+  requireRole(getDb(), r.organizationId, 'admin');
+  const row = check(await getSupabase().from('emission_activities').update({ review_status: status }).eq('id', id).select().single(), 'Could not update the review status.');
+  update((d) => void (d.activities = d.activities.map((x) => (x.id === id ? toActivity(row) : x))));
+  refreshAuditSoon(r.organizationId);
 }
 
 /** Duplicate = same facility, category, subtype and month. */
@@ -320,7 +550,48 @@ export function findDuplicate(d: DB, orgId: string, r: Pick<ActivityRecord, 'fac
   );
 }
 
-// ── Evidence ───────────────────────────────────────────────────────────────
+// ── Evidence (private "evidence" storage bucket) ───────────────────────────
+
+export const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
+
+/** Upload a file and record it. Path: <companyId>/<documentId>/<file name> (enforced by storage policies). */
+export async function uploadEvidenceRemote(
+  orgId: string,
+  file: Blob & { name?: string },
+  meta: { facilityId: string | null; reportingPeriodId: string | null; documentType: string; fileName?: string },
+  id = uid(),
+): Promise<EvidenceDocument> {
+  const userId = getDb().session.userId;
+  if (!userId) throw new PermissionError('Please log in first.');
+  if (file.size > MAX_EVIDENCE_BYTES) throw new Error('Files must be 10 MB or smaller.');
+  const sb = getSupabase();
+  const fileName = meta.fileName ?? file.name ?? 'document';
+  const storagePath = `${orgId}/${id}/${safeFileName(fileName)}`;
+  const mimeType = file.type || 'application/octet-stream';
+  const up = await sb.storage.from(EVIDENCE_BUCKET).upload(storagePath, file, { contentType: mimeType, upsert: false });
+  if (up.error) throw friendly(up.error, 'Could not upload the file.');
+  const res = await sb
+    .from('evidence_documents')
+    .insert({
+      id,
+      company_id: orgId,
+      facility_id: meta.facilityId,
+      assessment_id: meta.reportingPeriodId,
+      file_name: fileName,
+      mime_type: mimeType,
+      size_bytes: file.size,
+      storage_path: storagePath,
+      document_type: meta.documentType,
+      uploaded_by: userId,
+    })
+    .select()
+    .single();
+  if (res.error) {
+    await sb.storage.from(EVIDENCE_BUCKET).remove([storagePath]).catch(() => undefined);
+    throw friendly(res.error, 'Could not save the document.');
+  }
+  return toEvidence(res.data);
+}
 
 export async function uploadEvidence(
   orgId: string,
@@ -328,91 +599,74 @@ export async function uploadEvidence(
   meta: { facilityId: string | null; reportingPeriodId: string | null; documentType: string; attachToActivityId?: string },
 ): Promise<string> {
   requireRole(getDb(), orgId, 'editor');
-  if (file.size > 10 * 1024 * 1024) throw new Error('Files must be 10 MB or smaller.');
-  const id = uid();
-  const storagePath = `${orgId}/${id}/${file.name}`;
-  await putFile(storagePath, file);
+  const doc = await uploadEvidenceRemote(orgId, file, meta);
+  let attached: ActivityRecord | null = null;
+  if (meta.attachToActivityId) {
+    const row = check(
+      await getSupabase().from('emission_activities').update({ evidence_document_id: doc.id }).eq('id', meta.attachToActivityId).eq('company_id', orgId).select().single(),
+      'The file was uploaded but could not be attached to the record.',
+    );
+    attached = toActivity(row);
+  }
   update((d) => {
-    const userId = requireRole(d, orgId, 'editor');
-    const doc: EvidenceDocument = {
-      id,
-      organizationId: orgId,
-      facilityId: meta.facilityId,
-      reportingPeriodId: meta.reportingPeriodId,
-      fileName: file.name,
-      mimeType: file.type || 'application/octet-stream',
-      sizeBytes: file.size,
-      storagePath,
-      documentType: meta.documentType,
-      reviewStatus: 'unreviewed',
-      uploadedBy: userId,
-      createdAt: now(),
-    };
     d.evidence.push(doc);
-    if (meta.attachToActivityId) {
-      const a = d.activities.find((x) => x.id === meta.attachToActivityId && x.organizationId === orgId);
-      if (a) {
-        a.evidenceDocumentId = id;
-        a.updatedAt = now();
-      }
-    }
-    audit(d, orgId, 'evidence.upload', 'evidence_document', id, `Uploaded ${file.name}`);
+    if (attached) d.activities = d.activities.map((x) => (x.id === attached!.id ? attached! : x));
   });
-  return id;
+  refreshAuditSoon(orgId);
+  return doc.id;
 }
 
 export async function deleteEvidence(id: string) {
   const doc = getDb().evidence.find((e) => e.id === id);
   if (!doc) return;
   requireRole(getDb(), doc.organizationId, 'editor');
-  await deleteFile(doc.storagePath).catch(() => undefined);
+  const sb = getSupabase();
+  // Row first: the database detaches it from activity records (on delete set null).
+  check(await sb.from('evidence_documents').delete().eq('id', id), 'Could not delete the document.');
+  await sb.storage.from(EVIDENCE_BUCKET).remove([doc.storagePath]).catch(() => undefined);
   update((d) => {
     d.evidence = d.evidence.filter((e) => e.id !== id);
     d.activities.forEach((a) => {
       if (a.evidenceDocumentId === id) a.evidenceDocumentId = null;
     });
-    audit(d, doc.organizationId, 'evidence.delete', 'evidence_document', id, `Deleted ${doc.fileName}`);
   });
+  refreshAuditSoon(doc.organizationId);
+}
+
+export async function downloadEvidence(storagePath: string): Promise<Blob> {
+  const { data, error } = await getSupabase().storage.from(EVIDENCE_BUCKET).download(storagePath);
+  if (error || !data) throw friendly(error, 'Could not download the file.');
+  return data;
 }
 
 // ── Emission factors ───────────────────────────────────────────────────────
 
-export function addCustomFactor(orgId: string, f: Omit<EmissionFactor, 'id' | 'origin' | 'organizationId'>): string {
-  return update((d) => {
-    requireRole(d, orgId, 'admin');
-    const id = uid();
-    d.factors.push({ ...f, id, origin: 'user', organizationId: orgId });
-    audit(d, orgId, 'factor.create', 'emission_factor', id, `Added factor ${f.factorCode} (${f.version})`);
-    return id;
-  });
+export async function addCustomFactor(orgId: string, f: Omit<EmissionFactor, 'id' | 'origin' | 'organizationId'>): Promise<string> {
+  requireRole(getDb(), orgId, 'admin');
+  const factor: EmissionFactor = { ...f, id: uid(), origin: 'user', organizationId: orgId };
+  const row = check(await getSupabase().from('emission_factors').insert(factorRow(factor, orgId)).select().single(), 'Could not add the factor.');
+  update((d) => void d.factors.push(toFactor(row)));
+  refreshAuditSoon(orgId);
+  return factor.id;
+}
+
+async function setFactorReviewStatus(id: string, status: EmissionFactor['reviewStatus']) {
+  const f = getDb().factors.find((x) => x.id === id);
+  if (!f?.organizationId) throw new Error('Factor not found.');
+  requireRole(getDb(), f.organizationId, 'admin');
+  const row = check(await getSupabase().from('emission_factors').update({ review_status: status }).eq('id', id).select().single(), 'Could not update the factor.');
+  update((d) => void (d.factors = d.factors.map((x) => (x.id === id ? toFactor(row) : x))));
+  refreshAuditSoon(f.organizationId);
 }
 
 /** Factors are never edited in place: retiring keeps history intact for past runs. */
-export function retireFactor(id: string) {
-  update((d) => {
-    const f = d.factors.find((x) => x.id === id)!;
-    requireRole(d, f.organizationId!, 'admin');
-    f.reviewStatus = 'retired';
-    audit(d, f.organizationId!, 'factor.retire', 'emission_factor', id, `Retired factor ${f.factorCode} (${f.version})`);
-  });
-}
-
-export function setFactorStatus(id: string, status: 'approved' | 'provisional') {
-  update((d) => {
-    const f = d.factors.find((x) => x.id === id)!;
-    requireRole(d, f.organizationId!, 'admin');
-    f.reviewStatus = status;
-    audit(d, f.organizationId!, 'factor.review', 'emission_factor', id, `Factor ${f.factorCode} marked ${status}`);
-  });
-}
+export const retireFactor = (id: string) => setFactorReviewStatus(id, 'retired');
+export const setFactorStatus = (id: string, status: 'approved' | 'provisional') => setFactorReviewStatus(id, status);
 
 // ── Calculation runs ───────────────────────────────────────────────────────
 
-export function createCalculationRun(orgId: string, periodId: string): string {
-  return update((d) => runInto(d, orgId, periodId));
-}
-
-export function runInto(d: DB, orgId: string, periodId: string): string {
+/** Pure: compute a run from the cached activities (no side effects). */
+export function buildRun(d: DB, orgId: string, periodId: string): CalculationRun {
   const userId = requireRole(d, orgId, 'editor');
   const org = d.organizations.find((o) => o.id === orgId)!;
   const period = d.periods.find((p) => p.id === periodId && p.organizationId === orgId);
@@ -428,9 +682,8 @@ export function runInto(d: DB, orgId: string, periodId: string): string {
     }
   }
   const countedSummary = summarize(results.filter((r) => !excluded.has(r.category)));
-  const id = uid();
-  const run: CalculationRun = {
-    id,
+  return {
+    id: uid(),
     organizationId: orgId,
     reportingPeriodId: periodId,
     engineVersion: ENGINE_VERSION,
@@ -443,64 +696,84 @@ export function runInto(d: DB, orgId: string, periodId: string): string {
     summary: countedSummary,
     scope3Exclusions: structuredClone(period.scope3Exclusions),
   };
-  d.runs.push(run);
-  audit(d, orgId, 'calculation.run', 'calculation_run', id, `Calculation run: ${(countedSummary.totalKg / 1000).toFixed(2)} tCO2e from ${inputs.length} records`);
-  return id;
+}
+
+/** Save a run and all of its results in one database transaction. Returns the server's id and timestamp. */
+export async function saveRunRemote(run: CalculationRun): Promise<{ id: string; createdAt: string }> {
+  const sb = getSupabase();
+  const id = check(await sb.rpc('save_calculation_run', runRpcArgs(run)), 'Could not save the calculation run.') as string;
+  const row = check(await sb.from('calculation_runs').select('created_at').eq('id', id).single());
+  return { id, createdAt: ts(row.created_at) };
+}
+
+export async function createCalculationRun(orgId: string, periodId: string): Promise<string> {
+  const run = buildRun(getDb(), orgId, periodId);
+  const saved = await saveRunRemote(run);
+  // Use the server's timestamp: "results are out of date" compares it with server-side record times.
+  update((d) => void d.runs.push({ ...run, ...saved }));
+  refreshAuditSoon(orgId);
+  return saved.id;
 }
 
 // ── Reduction actions ──────────────────────────────────────────────────────
 
 export type ReductionDraft = Omit<ReductionAction, 'id' | 'organizationId' | 'createdAt' | 'updatedAt'>;
 
-export function saveReductionAction(orgId: string, draft: ReductionDraft, id?: string): string {
-  return update((d) => {
-    requireRole(d, orgId, 'editor');
-    if (id) {
-      const a = d.reductionActions.find((x) => x.id === id && x.organizationId === orgId)!;
-      Object.assign(a, draft, { updatedAt: now() });
-      audit(d, orgId, 'reduction.update', 'reduction_action', id, `Updated "${draft.title}" (${draft.status})`);
-      return id;
-    }
-    const nid = uid();
-    d.reductionActions.push({ ...draft, id: nid, organizationId: orgId, createdAt: now(), updatedAt: now() });
-    audit(d, orgId, 'reduction.create', 'reduction_action', nid, `Created "${draft.title}"`);
-    return nid;
-  });
+export async function saveReductionAction(orgId: string, draft: ReductionDraft, id?: string): Promise<string> {
+  requireRole(getDb(), orgId, 'editor');
+  const sb = getSupabase();
+  if (id) {
+    const row = check(await sb.from('reduction_actions').update(reductionRow(draft)).eq('id', id).eq('company_id', orgId).select().single(), 'Could not save the scenario.');
+    update((d) => void (d.reductionActions = d.reductionActions.map((x) => (x.id === id ? toReduction(row) : x))));
+    refreshAuditSoon(orgId);
+    return id;
+  }
+  const row = check(await sb.from('reduction_actions').insert({ company_id: orgId, ...reductionRow(draft) }).select().single(), 'Could not save the scenario.');
+  const a = toReduction(row);
+  update((d) => void d.reductionActions.push(a));
+  refreshAuditSoon(orgId);
+  return a.id;
 }
 
-export function deleteReductionAction(id: string) {
-  update((d) => {
-    const a = d.reductionActions.find((x) => x.id === id)!;
-    requireRole(d, a.organizationId, 'editor');
-    d.reductionActions = d.reductionActions.filter((x) => x.id !== id);
-    audit(d, a.organizationId, 'reduction.delete', 'reduction_action', id, `Deleted "${a.title}"`);
-  });
+export async function deleteReductionAction(id: string) {
+  const a = getDb().reductionActions.find((x) => x.id === id);
+  if (!a) return;
+  requireRole(getDb(), a.organizationId, 'editor');
+  check(await getSupabase().from('reduction_actions').delete().eq('id', id), 'Could not delete the scenario.');
+  update((d) => void (d.reductionActions = d.reductionActions.filter((x) => x.id !== id)));
+  refreshAuditSoon(a.organizationId);
 }
 
 // ── Reports ────────────────────────────────────────────────────────────────
 
-export function recordReport(orgId: string, r: Pick<Report, 'reportingPeriodId' | 'calculationRunId' | 'reportType' | 'fileName'>): string {
-  return update((d) => {
-    const userId = requireRole(d, orgId, 'viewer');
-    const id = uid();
-    d.reports.unshift({ ...r, id, organizationId: orgId, status: 'draft', generatedAt: now(), createdBy: userId });
-    audit(d, orgId, 'report.generate', 'report', id, `Generated ${r.reportType.toUpperCase()} report ${r.fileName}`);
-    return id;
-  });
+export async function recordReport(orgId: string, r: Pick<Report, 'reportingPeriodId' | 'calculationRunId' | 'reportType' | 'fileName'>): Promise<string> {
+  const userId = requireRole(getDb(), orgId, 'viewer');
+  const row = check(
+    await getSupabase()
+      .from('reports')
+      .insert({
+        company_id: orgId,
+        assessment_id: r.reportingPeriodId,
+        calculation_run_id: r.calculationRunId,
+        report_type: r.reportType,
+        file_name: r.fileName,
+        created_by: userId,
+      })
+      .select()
+      .single(),
+    'The report was downloaded but could not be recorded.',
+  );
+  const rep = toReport(row);
+  update((d) => void d.reports.unshift(rep));
+  refreshAuditSoon(orgId);
+  return rep.id;
 }
 
-export function setReportStatus(id: string, status: Report['status']) {
-  update((d) => {
-    const r = d.reports.find((x) => x.id === id)!;
-    requireRole(d, r.organizationId, 'admin');
-    r.status = status;
-    audit(d, r.organizationId, 'report.status', 'report', id, `Report marked ${status === 'draft' ? 'Draft' : 'Reviewed internally'}`);
-  });
-}
-
-// ── Demo data management ───────────────────────────────────────────────────
-
-export async function resetAllDemoData() {
-  await clearFiles().catch(() => undefined);
-  replaceDb(emptyDb());
+export async function setReportStatus(id: string, status: Report['status']) {
+  const r = getDb().reports.find((x) => x.id === id);
+  if (!r) return;
+  requireRole(getDb(), r.organizationId, 'admin');
+  const row = check(await getSupabase().from('reports').update({ status }).eq('id', id).select().single(), 'Could not update the report.');
+  update((d) => void (d.reports = d.reports.map((x) => (x.id === id ? toReport(row) : x))));
+  refreshAuditSoon(r.organizationId);
 }

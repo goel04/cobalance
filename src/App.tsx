@@ -8,7 +8,7 @@ import { AboutPage, HowItWorksPage, MissionPage, TransparencyPage } from '@/page
 import { CompanyPage, ContactPage, PartnershipsPage, ResourcesPage } from '@/pages/marketing/CompanyPages';
 import { PrivacyPage, TermsPage } from '@/pages/marketing/LegalPages';
 import NotFoundPage from '@/pages/marketing/NotFoundPage';
-import { ForgotPasswordPage, LoginPage, SignupPage } from '@/pages/auth/AuthPages';
+import { ForgotPasswordPage, LoginPage, ResetPasswordPage, SignupPage } from '@/pages/auth/AuthPages';
 import { AppLayout } from '@/components/app/AppLayout';
 import { RequireAuth, RequireOrganization } from '@/components/app/guards';
 
@@ -59,6 +59,7 @@ export default function App() {
         <Route path="login" element={<LoginPage />} />
         <Route path="signup" element={<SignupPage />} />
         <Route path="forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="reset-password" element={<ResetPasswordPage />} />
 
         <Route element={<RequireAuth />}>
           <Route path="onboarding" element={<OnboardingPage />} />

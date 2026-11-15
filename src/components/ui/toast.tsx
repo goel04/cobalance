@@ -26,9 +26,13 @@ export function toast(message: string, tone: Toast['tone'] = 'success') {
 }
 
 /** Run an action and report failures (permission, validation, storage) as an error toast. */
-export function attempt<T>(fn: () => T, success?: string): T | undefined {
+/**
+ * Run an action (sync or async), toast its outcome, and resolve to its result —
+ * or `undefined` if it failed. Writes go to the server, so always await this.
+ */
+export async function attempt<T>(fn: () => T | Promise<T>, success?: string): Promise<T | undefined> {
   try {
-    const out = fn();
+    const out = await fn();
     if (success) toast(success);
     return out;
   } catch (e) {

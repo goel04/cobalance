@@ -93,9 +93,12 @@ export default function FacilitiesPage() {
             defaultValues={editing === 'new' ? { state: org.state, city: org.city, industry: org.industry } : editing}
             submitLabel={editing === 'new' ? 'Add facility' : 'Save changes'}
             onCancel={() => setEditing(null)}
-            onSubmit={(v) => {
-              const ok = attempt(() => (editing === 'new' ? createFacility(org.id, v) : updateFacility(editing.id, v)) ?? true, editing === 'new' ? 'Facility added' : 'Facility updated');
-              if (ok !== undefined) setEditing(null);
+            onSubmit={async (v) => {
+              const ok = await attempt(
+                () => (editing === 'new' ? createFacility(org.id, v) : updateFacility(editing.id, v)).then(() => true),
+                editing === 'new' ? 'Facility added' : 'Facility updated',
+              );
+              if (ok) setEditing(null);
             }}
           />
         )}
@@ -113,8 +116,8 @@ export default function FacilitiesPage() {
             </Button>
             <Button
               variant="danger"
-              onClick={() => {
-                if (deleting && attempt(() => (deleteFacility(deleting.id), true), 'Facility deleted')) setDeleting(null);
+              onClick={async () => {
+                if (deleting && (await attempt(() => deleteFacility(deleting.id).then(() => true), 'Facility deleted'))) setDeleting(null);
               }}
             >
               Delete
